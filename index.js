@@ -234,14 +234,14 @@ function startBombsTimer(roomId) {
       return;
     }
 
-    game.bombsTimeLeft -= 2;
+    game.bombsTimeLeft = Math.max(0, game.bombsTimeLeft - 2);
 
     broadcast(roomId, {
       type: "bombs_phase_update",
       payload: { timeLeft: game.bombsTimeLeft }
     });
 
-    if (game.bombsTimeLeft <= 0) {
+    if (game.bombsTimeLeft === 0) {
       clearInterval(game.bombsTimer);
       game.bombsTimer = null;
       finishBombsPhase(roomId);
@@ -364,7 +364,7 @@ function startMoveTimer(roomId) {
       return;
     }
 
-    game.moveTimeLeft -= 2;
+    game.bombsTimeLeft = Math.max(0, game.bombsTimeLeft - 2);
 
     broadcast(roomId, {
       type: "move_timer_update",
@@ -374,7 +374,7 @@ function startMoveTimer(roomId) {
       }
     });
 
-    if (game.moveTimeLeft <= 0) {
+    if (game.moveTimeLeft === 0) {
       clearInterval(game.moveTimer);
       game.moveTimer = null;
       autoMove(roomId);
