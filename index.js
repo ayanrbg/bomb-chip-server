@@ -1,3 +1,10 @@
+import admin from "firebase-admin";
+import serviceAccount from "./firebase-service-account.json" assert { type: "json" };
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+
 import { GameEngine } from "./gameEngine.js";
 
 const activeGames = new Map();
@@ -28,7 +35,53 @@ app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
+app.post("/firebase-login", async (req, res) => {
+  const { idToken } = req.body;
 
+  if (!idToken) {
+    return res.status(400).json({ error: "Missing idToken" });
+  }
+
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+
+    const firebaseUid = decodedToken.uid;
+    const email = decodedToken.email;
+    const name = decodedToken.name || "Player";
+
+    let userResult = await pool.query(
+      "SELECT * FROM users WHERE firebase_uid = $1",
+      [firebaseUid]
+    );
+
+    let user;
+
+    if (userResult.rows.length === 0) {
+      const insert = await pool.query(
+        `INSERT INTO users (email, nickname, firebase_uid, balance)
+         VALUES ($1, $2, $3, 1000)
+         RETURNING id, nickname`,
+        [email, name, firebaseUid]
+      );
+
+      user = insert.rows[0];
+    } else {
+      user = userResult.rows[0];
+    }
+
+    const token = jwt.sign(
+      { id: user.id, nickname: user.nickname },
+      process.env.JWT_SECRET,
+      { expiresIn: "30m" }
+    );
+
+    res.json({ token });
+
+  } catch (err) {
+    console.error(err);
+    res.status(401).json({ error: "Invalid Firebase token" });
+  }
+});
 // ===== HTTP: Проверка сервера =====
 app.get("/", (req, res) => {
   res.send("Server is running 🚀");
