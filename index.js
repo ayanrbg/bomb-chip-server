@@ -8,7 +8,7 @@ admin.initializeApp({
 import { GameEngine } from "./gameEngine.js";
 
 const activeGames = new Map();
-
+const playConfirmations = new Map();
 import express from "express";
 import http from "http";
 import { WebSocketServer } from "ws";
@@ -63,8 +63,13 @@ app.post("/firebase-login", async (req, res) => {
          RETURNING id, nickname`,
         [email, name, firebaseUid]
       );
-
+      
       user = insert.rows[0];
+
+      await pool.query(
+  "INSERT INTO user_customization (user_id) VALUES ($1)",
+  [user.id]
+);
     } else {
       user = userResult.rows[0];
     }
@@ -72,7 +77,7 @@ app.post("/firebase-login", async (req, res) => {
     const token = jwt.sign(
       { id: user.id, nickname: user.nickname },
       process.env.JWT_SECRET,
-      { expiresIn: "30m" }
+      { expiresIn: "1d" }
     );
 
     res.json({ token });
@@ -115,7 +120,7 @@ app.post("/register", async (req, res) => {
     const token = jwt.sign(
       { id: user.id, nickname: user.nickname },
       process.env.JWT_SECRET,
-      { expiresIn: "30m" }
+      { expiresIn: "1d" }
     );
 
     res.json({ token });
@@ -148,7 +153,7 @@ app.post("/login", async (req, res) => {
     const token = jwt.sign(
       { id: user.id, nickname: user.nickname },
       process.env.JWT_SECRET,
-      { expiresIn: "30m" }
+      { expiresIn: "1d" }
     );
 
     res.json({ token });
@@ -364,7 +369,7 @@ function startMoveTimer(roomId) {
       return;
     }
 
-    game.bombsTimeLeft = Math.max(0, game.bombsTimeLeft - 2);
+    game.moveTimeLeft = Math.max(0, game.moveTimeLeft - 2);
 
     broadcast(roomId, {
       type: "move_timer_update",
@@ -446,6 +451,7 @@ async function broadcastRoomInfo(roomId) {
       r.bet,
       h.id as host_id,
       r.host_ready,
+      r.password_hash,
       r.guest_ready,
       h.nickname as host_nickname,
       g.id as guest_id,
@@ -466,6 +472,7 @@ async function broadcastRoomInfo(roomId) {
       id: room.id,
       status: room.status,
       bet: room.bet,
+      isPrivate: !!room.password_hash,
       host: room.host_id ? {
         id: room.host_id,
         nickname: room.host_nickname,
@@ -487,7 +494,7 @@ async function broadcastRoomInfo(roomId) {
   });
 }
 // ===== WebSocket =====
-wss.on("connection", (ws, req) => {
+wss.on("connection", async (ws, req) => {
   const url = new URL(req.url, "http://localhost");
   const token = url.searchParams.get("token");
 
@@ -503,7 +510,26 @@ wss.on("connection", (ws, req) => {
       id: decoded.id,
       nickname: decoded.nickname
     };
+    // 🔥 Отправляем кастомизацию игроку
+    const customizationResult = await pool.query(`
+      SELECT 
+        uc.skin_id,
+        uc.animation_id,
+        uc.effect_id,
+        s1.code as skin_code,
+        s2.code as animation_code,
+        s3.code as effect_code
+      FROM user_customization uc
+      LEFT JOIN shop_items s1 ON uc.skin_id = s1.id
+      LEFT JOIN shop_items s2 ON uc.animation_id = s2.id
+      LEFT JOIN shop_items s3 ON uc.effect_id = s3.id
+      WHERE uc.user_id = $1
+    `, [ws.user.id]);
 
+    ws.send(JSON.stringify({
+      type: "user_customization",
+      payload: customizationResult.rows[0]
+    }));
     console.log("Connected:", ws.user.nickname);
 
   } catch (err) {
@@ -539,7 +565,7 @@ wss.on("connection", (ws, req) => {
     }
     if (data.type === "create_room") {
   try {
-    const { bet } = data;
+    const { bet , password} = data;
 
     if (!bet || bet <= 0) {
       return ws.send(JSON.stringify({
@@ -568,11 +594,15 @@ wss.on("connection", (ws, req) => {
       "UPDATE users SET balance = balance - $1 WHERE id = $2",
       [bet, ws.user.id]
     );
+    let passwordHash = null;
 
+  if (password) {
+    passwordHash = await bcrypt.hash(password, 10);
+  }
     // создаём комнату
     const result = await pool.query(
-    "INSERT INTO rooms (host_id, bet, host_ready, guest_ready) VALUES ($1,$2,false,false) RETURNING *",
-    [ws.user.id, bet]
+    "INSERT INTO rooms (host_id, bet, host_ready, guest_ready, password_hash) VALUES ($1,$2,false,false,$3) RETURNING *",
+    [ws.user.id, bet, passwordHash]
   );
 
 
@@ -597,7 +627,7 @@ wss.on("connection", (ws, req) => {
 
   if (data.type === "join_room") {
   try {
-    const { roomId } = data;
+    const { roomId , password} = data;
 
     const roomResult = await pool.query(
       "SELECT * FROM rooms WHERE id = $1",
@@ -612,7 +642,28 @@ wss.on("connection", (ws, req) => {
     }
 
     const room = roomResult.rows[0];
+    // 🔐 Проверка пароля
+if (room.password_hash) {
 
+  if (!password) {
+    return ws.send(JSON.stringify({
+      type: "error",
+      message: "Room requires password"
+    }));
+  }
+
+  const validPassword = await bcrypt.compare(
+    password,
+    room.password_hash
+  );
+
+  if (!validPassword) {
+    return ws.send(JSON.stringify({
+      type: "error",
+      message: "Wrong password"
+    }));
+  }
+}
     // анти-дубль
     if (room.host_id === ws.user.id || room.guest_id === ws.user.id) {
       ws.roomId = roomId;
@@ -773,6 +824,294 @@ if (data.type === "get_rooms_list") {
       }));
     }
   }
+  if (data.type === "equip_item") {
+
+  const { itemId } = data;
+
+  const itemResult = await pool.query(
+    "SELECT * FROM shop_items WHERE id = $1",
+    [itemId]
+  );
+
+  if (itemResult.rows.length === 0) {
+    return ws.send(JSON.stringify({
+      type: "error",
+      message: "Item not found"
+    }));
+  }
+
+  const item = itemResult.rows[0];
+
+  // Проверяем владеет ли игрок
+  const ownership = await pool.query(
+    "SELECT * FROM user_items WHERE user_id = $1 AND item_id = $2",
+    [ws.user.id, itemId]
+  );
+
+  if (ownership.rows.length === 0 && item.price > 0) {
+    return ws.send(JSON.stringify({
+      type: "error",
+      message: "You do not own this item"
+    }));
+  }
+
+  // Определяем куда записывать
+  const allowedColumns = {
+    skin: "skin_id",
+    animation: "animation_id",
+    effect: "effect_id"
+  };
+
+  const column = allowedColumns[item.type];
+
+  if (!column) {
+    return ws.send(JSON.stringify({
+      type: "error",
+      message: "Invalid item type"
+    }));
+  }
+
+  if (!column) return;
+
+  await pool.query(
+    `UPDATE user_customization 
+     SET ${column} = $1, updated_at = NOW()
+     WHERE user_id = $2`,
+    [itemId, ws.user.id]
+  );
+
+  ws.send(JSON.stringify({
+    type: "equip_success",
+    payload: { itemId }
+  }));
+}
+if (data.type === "buy_item") {
+
+  const { itemId } = data;
+
+  const itemResult = await pool.query(
+    "SELECT * FROM shop_items WHERE id = $1",
+    [itemId]
+  );
+
+  if (itemResult.rows.length === 0) return;
+
+  const item = itemResult.rows[0];
+
+  if (item.price <= 0) {
+    return ws.send(JSON.stringify({
+      type: "error",
+      message: "Item is free"
+    }));
+  }
+
+  const client = await pool.connect();
+
+  try {
+
+    await client.query("BEGIN");
+
+    const userResult = await client.query(
+      "SELECT balance FROM users WHERE id = $1 FOR UPDATE",
+      [ws.user.id]
+    );
+
+    const balance = userResult.rows[0].balance;
+
+    if (balance < item.price) {
+      await client.query("ROLLBACK");
+      return ws.send(JSON.stringify({
+        type: "error",
+        message: "Not enough balance"
+      }));
+    }
+
+    await client.query(
+      "UPDATE users SET balance = balance - $1 WHERE id = $2",
+      [item.price, ws.user.id]
+    );
+
+    await client.query(
+      "INSERT INTO user_items (user_id, item_id) VALUES ($1,$2)",
+      [ws.user.id, itemId]
+    );
+
+    await client.query("COMMIT");
+
+    ws.send(JSON.stringify({
+      type: "purchase_success",
+      payload: { itemId }
+    }));
+
+  } catch (err) {
+
+    await client.query("ROLLBACK");
+    console.error(err);
+
+    ws.send(JSON.stringify({
+      type: "error",
+      message: "Purchase failed"
+    }));
+
+  } finally {
+    client.release();
+  }
+}
+if (data.type === "send_friend_request") {
+
+  const targetId = Number(data.userId);
+
+  if (targetId === ws.user.id) return;
+
+  const existing = await pool.query(
+    `SELECT * FROM friends 
+     WHERE requester_id = $1 AND addressee_id = $2`,
+    [ws.user.id, targetId]
+  );
+
+  if (existing.rows.length > 0) {
+    return ws.send(JSON.stringify({
+      type: "error",
+      message: "Request already sent"
+    }));
+  }
+
+  const result = await pool.query(
+    `INSERT INTO friends (requester_id, addressee_id, status)
+     VALUES ($1,$2,'pending')
+     RETURNING *`,
+    [ws.user.id, targetId]
+  );
+
+  // уведомляем получателя если онлайн
+  wss.clients.forEach(client => {
+    if (client.user?.id === targetId) {
+      client.send(JSON.stringify({
+        type: "friend_request_received",
+        payload: result.rows[0]
+      }));
+    }
+  });
+
+  ws.send(JSON.stringify({
+    type: "friend_request_sent"
+  }));
+}
+if (data.type === "reconnect") {
+
+  const roomResult = await pool.query(
+    "SELECT * FROM rooms WHERE host_id = $1 OR guest_id = $1",
+    [ws.user.id]
+  );
+
+  if (roomResult.rows.length === 0) {
+    return ws.send(JSON.stringify({
+      type: "reconnect_ok",
+      payload: { inRoom: false }
+    }));
+  }
+
+  const room = roomResult.rows[0];
+  ws.roomId = room.id;
+
+  ws.send(JSON.stringify({
+    type: "reconnect_ok",
+    payload: {
+      inRoom: true,
+      roomId: room.id
+    }
+  }));
+
+  await broadcastRoomInfo(room.id);
+
+  if (activeGames.has(room.id)) {
+
+    const game = activeGames.get(room.id);
+
+    // 🔥 ВАЖНО
+    delete game.disconnected[ws.user.id];
+
+    ws.send(JSON.stringify({
+      type: "game_state_restore",
+      payload: {
+        phase: game.phase,
+        turn: game.turn,
+        bombsTimeLeft: game.bombsTimeLeft,
+        moveTimeLeft: game.moveTimeLeft
+      }
+    }));
+  }
+}
+if (data.type === "accept_friend_request") {
+
+  const requestId = data.requestId;
+
+  const result = await pool.query(
+    `UPDATE friends
+     SET status = 'accepted'
+     WHERE id = $1 AND addressee_id = $2
+     RETURNING *`,
+    [requestId, ws.user.id]
+  );
+
+  if (result.rows.length === 0) return;
+
+  const request = result.rows[0];
+
+  // уведомляем второго игрока
+  wss.clients.forEach(client => {
+    if (client.user?.id === request.requester_id) {
+      client.send(JSON.stringify({
+        type: "friend_request_accepted"
+      }));
+    }
+  });
+
+  ws.send(JSON.stringify({
+    type: "friend_added"
+  }));
+}
+if (data.type === "get_friends") {
+
+  const result = await pool.query(`
+    SELECT u.id, u.nickname
+    FROM friends f
+    JOIN users u 
+      ON (u.id = f.requester_id AND f.addressee_id = $1)
+      OR (u.id = f.addressee_id AND f.requester_id = $1)
+    WHERE f.status = 'accepted'
+  `, [ws.user.id]);
+
+  ws.send(JSON.stringify({
+    type: "friends_list",
+    payload: result.rows
+  }));
+}
+if (data.type === "invite_to_room") {
+
+  if (!ws.roomId) return;
+
+  const friendId = Number(data.friendId);
+
+  const result = await pool.query(
+    `INSERT INTO game_invites (from_user_id, to_user_id, room_id)
+     VALUES ($1,$2,$3)
+     RETURNING *`,
+    [ws.user.id, friendId, ws.roomId]
+  );
+
+  wss.clients.forEach(client => {
+    if (client.user?.id === friendId) {
+      client.send(JSON.stringify({
+        type: "game_invite_received",
+        payload: {
+          roomId: ws.roomId,
+          from: ws.user.nickname
+        }
+      }));
+    }
+  });
+}
   if (data.type === "leave_room") {
   try {
     if (!ws.roomId) {
@@ -885,6 +1224,137 @@ if (data.type === "get_rooms_list") {
     }));
   }
 }
+if (data.type === "get_shop_items") {
+
+  // получаем все предметы
+  const itemsResult = await pool.query(`
+    SELECT id, code, name, type, price, currency
+    FROM shop_items
+    ORDER BY type, price
+  `);
+
+  // получаем купленные предметы игрока
+  const ownedResult = await pool.query(
+    "SELECT item_id FROM user_items WHERE user_id = $1",
+    [ws.user.id]
+  );
+
+  const ownedIds = new Set(
+    ownedResult.rows.map(r => r.item_id)
+  );
+
+  // получаем активную кастомизацию
+  const customizationResult = await pool.query(`
+    SELECT skin_id, animation_id, effect_id
+    FROM user_customization
+    WHERE user_id = $1
+  `, [ws.user.id]);
+
+  const active = customizationResult.rows[0] || {};
+
+  const items = itemsResult.rows.map(item => {
+
+    const isOwned =
+      item.price === 0 || ownedIds.has(item.id);
+
+    let isActive = false;
+
+    if (item.type === "skin" && active.skin_id === item.id)
+      isActive = true;
+
+    if (item.type === "animation" && active.animation_id === item.id)
+      isActive = true;
+
+    if (item.type === "effect" && active.effect_id === item.id)
+      isActive = true;
+
+    return {
+      id: item.id,
+      code: item.code,
+      name: item.name,
+      type: item.type,
+      price: item.price,
+      currency: item.currency,
+      owned: isOwned,
+      active: isActive
+    };
+  });
+
+  ws.send(JSON.stringify({
+    type: "shop_items",
+    payload: items
+  }));
+}
+if (data.type === "kick_player") {
+
+  if (!ws.roomId) return;
+
+  const roomResult = await pool.query(
+    "SELECT * FROM rooms WHERE id = $1",
+    [ws.roomId]
+  );
+
+  if (roomResult.rows.length === 0) return;
+
+  const room = roomResult.rows[0];
+
+  // Только хост может кикать
+  if (room.host_id !== ws.user.id) {
+    return ws.send(JSON.stringify({
+      type: "error",
+      message: "Only host can kick"
+    }));
+  }
+
+  const targetId = Number(data.playerId);
+
+  // Можно кикать только гостя
+  if (room.guest_id !== targetId) {
+    return ws.send(JSON.stringify({
+      type: "error",
+      message: "Invalid target"
+    }));
+  }
+
+  // ❌ Нельзя кикать во время игры
+  if (room.status === "playing") {
+    return ws.send(JSON.stringify({
+      type: "error",
+      message: "Cannot kick during game"
+    }));
+  }
+
+  // Возвращаем деньги гостю
+  await pool.query(
+    "UPDATE users SET balance = balance + $1 WHERE id = $2",
+    [room.bet, targetId]
+  );
+
+  // Удаляем гостя из комнаты
+  await pool.query(
+    `UPDATE rooms 
+     SET guest_id = NULL, 
+         guest_ready = false,
+         status = 'waiting'
+     WHERE id = $1`,
+    [ws.roomId]
+  );
+
+  // Сбрасываем комнату у кикнутого
+  wss.clients.forEach(client => {
+    if (client.user?.id === targetId) {
+      client.roomId = null;
+
+      client.send(JSON.stringify({
+        type: "kicked_from_room"
+      }));
+    }
+  });
+
+  // 🔥 Вот самое важное
+  // Отправляем ОБНОВЛЕНИЕ КОМНАТЫ всем
+  await broadcastRoomInfo(ws.roomId);
+}
   if (data.type === "player_ready") {
   try {
     if (!ws.roomId) return;
@@ -926,22 +1396,15 @@ if (data.type === "get_rooms_list") {
 
   if (activeGames.has(ws.roomId)) return;
 
-  await pool.query(
-    "UPDATE rooms SET status = 'playing' WHERE id = $1",
-    [ws.roomId]
-  );
+  // отправляем запрос на подтверждение игры
+  broadcast(ws.roomId, {
+    type: "play_request",
+    payload: {
+      message: "Confirm start game?"
+    }
+  });
 
-  const game = new GameEngine(
-    ws.roomId,
-    updatedRoom.host_id,
-    updatedRoom.guest_id
-  );
-
-  activeGames.set(ws.roomId, game);
-
-  broadcast(ws.roomId, { type: "game_started" });
-  broadcast(ws.roomId, { type: "request_bombs" });
-  startBombsTimer(ws.roomId);
+  return; // ❗ НЕ запускаем игру сразу
 }
 
     await broadcastRoomInfo(ws.roomId);
@@ -973,6 +1436,62 @@ if (data.type === "place_bombs") {
     });
     finishBombsPhase(ws.roomId);
   }
+}
+if (data.type === "play_confirm") {
+
+  const { accept } = data;
+
+  const roomResult = await pool.query(
+    "SELECT * FROM rooms WHERE id = $1",
+    [ws.roomId]
+  );
+
+  if (roomResult.rows.length === 0) return;
+
+  const room = roomResult.rows[0];
+
+  // 🔥 используем отдельную Map
+  if (!playConfirmations.has(ws.roomId)) {
+    playConfirmations.set(ws.roomId, {});
+  }
+
+  const confirmations = playConfirmations.get(ws.roomId);
+
+  confirmations[ws.user.id] = accept;
+
+  // если кто-то отказался
+  if (!accept) {
+    broadcast(ws.roomId, { type: "play_declined" });
+    playConfirmations.delete(ws.roomId);
+    return;
+  }
+
+  const players = [room.host_id, room.guest_id];
+
+  const allAccepted = players.every(id => confirmations[id] === true);
+
+  if (!allAccepted) return;
+
+  // ✅ все подтвердили
+  playConfirmations.delete(ws.roomId);
+
+  await pool.query(
+    "UPDATE rooms SET status = 'playing' WHERE id = $1",
+    [ws.roomId]
+  );
+
+  const game = new GameEngine(
+    ws.roomId,
+    room.host_id,
+    room.guest_id
+  );
+
+  activeGames.set(ws.roomId, game);
+
+  broadcast(ws.roomId, { type: "game_started" });
+  broadcast(ws.roomId, { type: "request_bombs" });
+
+  startBombsTimer(ws.roomId);
 }
 if (data.type === "make_move") {
 
@@ -1019,12 +1538,41 @@ if (data.type === "make_move") {
 });
 
   ws.on("close", () => {
-    console.log("Disconnected:", ws.user?.nickname);
-    if (ws.roomId) {
-    // эмулируем leave_room
-    ws.emit("message", JSON.stringify({ type: "leave_room" }));
+
+  if (!ws.roomId) return;
+
+  const game = activeGames.get(ws.roomId);
+  if (!game) return;
+
+  if (!game.disconnected) {
+    game.disconnected = {};
   }
-  });
+
+  game.disconnected[ws.user.id] = Date.now();
+
+  setTimeout(() => {
+
+    if (!activeGames.has(ws.roomId)) return;
+
+    const currentGame = activeGames.get(ws.roomId);
+
+    if (!currentGame.disconnected) return;
+
+    const stillDisconnected =
+      currentGame.disconnected[ws.user.id];
+
+    if (stillDisconnected) {
+
+      const opponentId = Object.keys(currentGame.players)
+        .map(Number)
+        .find(id => id !== ws.user.id);
+
+      finishGame(ws.roomId, opponentId);
+      cleanupGame(ws.roomId);
+    }
+
+  }, 30000);
+});
 });
 
 // ===== Запуск =====

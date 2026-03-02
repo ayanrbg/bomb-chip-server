@@ -7,7 +7,8 @@ export class GameEngine {
 
     this.bombsTimeLeft = 20;   // 20 секунд на бомбы
     this.moveTimeLeft = 15;    // 15 секунд на ход
-    this.phase = "placing_bombs"; // placing_bombs | playing | finished
+    this.phase = "placing_bombs";
+    this.disconnected = {}; // placing_bombs | playing | finished
 
     // 🔥 ВСЕ ID ПРИВОДИМ К ЧИСЛАМ
     hostId = Number(hostId);
