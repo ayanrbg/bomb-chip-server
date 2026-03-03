@@ -8,7 +8,7 @@ admin.initializeApp({
 import { GameEngine } from "./gameEngine.js";
 
 const activeGames = new Map();
-const playConfirmations = new Map();
+const roomCountdowns = new Map();
 import express from "express";
 import http from "http";
 import { WebSocketServer } from "ws";
@@ -393,6 +393,75 @@ function finishBombsPhase(roomId) {
 
   startMoveTimer(roomId);
 }
+function startGameCountdown(roomId) {
+
+  if (roomCountdowns.has(roomId)) return;
+
+  let timeLeft = 5;
+
+  broadcast(roomId, {
+    type: "game_countdown",
+    payload: { timeLeft }
+  });
+
+  const interval = setInterval(async () => {
+
+    timeLeft--;
+
+    broadcast(roomId, {
+      type: "game_countdown",
+      payload: { timeLeft }
+    });
+
+    if (timeLeft <= 0) {
+      clearInterval(interval);
+      roomCountdowns.delete(roomId);
+
+      await launchGame(roomId);
+    }
+
+  }, 1000);
+
+  roomCountdowns.set(roomId, interval);
+}
+async function launchGame(roomId) {
+
+  const roomResult = await pool.query(
+    "SELECT * FROM rooms WHERE id = $1",
+    [roomId]
+  );
+
+  if (roomResult.rows.length === 0) return;
+
+  const room = roomResult.rows[0];
+
+  // ❗ ЗАЩИТА №1 — должны быть оба игрока
+  if (!room.host_id || !room.guest_id) return;
+
+  // ❗ ЗАЩИТА №2 — оба должны быть ready
+  if (!room.host_ready || !room.guest_ready) return;
+
+  // ❗ ЗАЩИТА №3 — не запускать повторно
+  if (room.status === "playing") return;
+
+  await pool.query(
+    "UPDATE rooms SET status = 'playing' WHERE id = $1",
+    [roomId]
+  );
+
+  const game = new GameEngine(
+    roomId,
+    room.host_id,
+    room.guest_id
+  );
+
+  activeGames.set(roomId, game);
+
+  broadcast(roomId, { type: "game_started" });
+  broadcast(roomId, { type: "request_bombs" });
+
+  startBombsTimer(roomId);
+}
 function startMoveTimer(roomId) {
 
   const game = activeGames.get(roomId);
@@ -763,7 +832,12 @@ if (room.password_hash) {
     }));
 
     await broadcastRoomInfo(roomId);
-
+    // если теперь в комнате 2 игрока
+    if (updateResult.rows[0].guest_id) {
+      broadcast(roomId, {
+        type: "play_request"
+      });
+    }
   } catch (err) {
     console.error(err);
     ws.send(JSON.stringify({
@@ -1070,8 +1144,9 @@ if (data.type === "reconnect") {
     const game = activeGames.get(room.id);
 
     // 🔥 ВАЖНО
-    delete game.disconnected[ws.user.id];
-
+    if (game.disconnected) {
+  delete game.disconnected[ws.user.id];
+}
     ws.send(JSON.stringify({
       type: "game_state_restore",
       payload: {
@@ -1081,6 +1156,7 @@ if (data.type === "reconnect") {
         moveTimeLeft: game.moveTimeLeft
       }
     }));
+    sendTurnState(room.id);
   }
 }
 if (data.type === "accept_friend_request") {
@@ -1214,7 +1290,14 @@ if (data.type === "invite_to_room") {
           client.roomId = null;
         }
       });
+      if (roomCountdowns.has(roomId)) {
+        clearInterval(roomCountdowns.get(roomId));
+        roomCountdowns.delete(roomId);
 
+        broadcast(roomId, {
+          type: "countdown_cancelled"
+        });
+      }
       ws.roomId = null;
       cleanupGame(roomId);
       return ws.send(JSON.stringify({
@@ -1433,23 +1516,22 @@ if (data.type === "kick_player") {
     const updatedRoom = updated.rows[0];
 
     // если оба готовы — старт
-    if (updatedRoom.host_ready && updatedRoom.guest_ready) {
+    
+    if (!updatedRoom.host_ready || !updatedRoom.guest_ready) {
+  if (roomCountdowns.has(ws.roomId)) {
+    clearInterval(roomCountdowns.get(ws.roomId));
+    roomCountdowns.delete(ws.roomId);
 
-  if (activeGames.has(ws.roomId)) return;
-
-  // отправляем запрос на подтверждение игры
-  broadcast(ws.roomId, {
-    type: "play_request",
-    payload: {
-      message: "Confirm start game?"
-    }
-  });
-
-  return; // ❗ НЕ запускаем игру сразу
-}
-
-    await broadcastRoomInfo(ws.roomId);
-
+    broadcast(ws.roomId, {
+      type: "countdown_cancelled"
+    });
+  }
+}  
+    
+      if (updatedRoom.host_ready && updatedRoom.guest_ready) {
+        startGameCountdown(ws.roomId);
+      }
+      await broadcastRoomInfo(ws.roomId);
   } catch (err) {
     console.error(err);
   }
@@ -1478,62 +1560,62 @@ if (data.type === "place_bombs") {
     finishBombsPhase(ws.roomId);
   }
 }
-if (data.type === "play_confirm") {
+// if (data.type === "play_confirm") {
 
-  const { accept } = data;
+//   const { accept } = data;
 
-  const roomResult = await pool.query(
-    "SELECT * FROM rooms WHERE id = $1",
-    [ws.roomId]
-  );
+//   const roomResult = await pool.query(
+//     "SELECT * FROM rooms WHERE id = $1",
+//     [ws.roomId]
+//   );
 
-  if (roomResult.rows.length === 0) return;
+//   if (roomResult.rows.length === 0) return;
 
-  const room = roomResult.rows[0];
+//   const room = roomResult.rows[0];
 
-  // 🔥 используем отдельную Map
-  if (!playConfirmations.has(ws.roomId)) {
-    playConfirmations.set(ws.roomId, {});
-  }
+//   // 🔥 используем отдельную Map
+//   if (!playConfirmations.has(ws.roomId)) {
+//     playConfirmations.set(ws.roomId, {});
+//   }
 
-  const confirmations = playConfirmations.get(ws.roomId);
+//   const confirmations = playConfirmations.get(ws.roomId);
 
-  confirmations[ws.user.id] = accept;
+//   confirmations[ws.user.id] = accept;
 
-  // если кто-то отказался
-  if (!accept) {
-    broadcast(ws.roomId, { type: "play_declined" });
-    playConfirmations.delete(ws.roomId);
-    return;
-  }
+//   // если кто-то отказался
+//   if (!accept) {
+//     broadcast(ws.roomId, { type: "play_declined" });
+//     playConfirmations.delete(ws.roomId);
+//     return;
+//   }
 
-  const players = [room.host_id, room.guest_id];
+//   const players = [room.host_id, room.guest_id];
 
-  const allAccepted = players.every(id => confirmations[id] === true);
+//   const allAccepted = players.every(id => confirmations[id] === true);
 
-  if (!allAccepted) return;
+//   if (!allAccepted) return;
 
-  // ✅ все подтвердили
-  playConfirmations.delete(ws.roomId);
+//   // ✅ все подтвердили
+//   playConfirmations.delete(ws.roomId);
 
-  await pool.query(
-    "UPDATE rooms SET status = 'playing' WHERE id = $1",
-    [ws.roomId]
-  );
+//   await pool.query(
+//     "UPDATE rooms SET status = 'playing' WHERE id = $1",
+//     [ws.roomId]
+//   );
 
-  const game = new GameEngine(
-    ws.roomId,
-    room.host_id,
-    room.guest_id
-  );
+//   const game = new GameEngine(
+//     ws.roomId,
+//     room.host_id,
+//     room.guest_id
+//   );
 
-  activeGames.set(ws.roomId, game);
+//   activeGames.set(ws.roomId, game);
 
-  broadcast(ws.roomId, { type: "game_started" });
-  broadcast(ws.roomId, { type: "request_bombs" });
+//   broadcast(ws.roomId, { type: "game_started" });
+//   broadcast(ws.roomId, { type: "request_bombs" });
 
-  startBombsTimer(ws.roomId);
-}
+//   startBombsTimer(ws.roomId);
+// }
 if (data.type === "make_move") {
 
   const game = activeGames.get(ws.roomId);
@@ -1580,10 +1662,21 @@ if (data.type === "make_move") {
 
   ws.on("close", () => {
 
-  if (!ws.roomId) return;
+  const roomId = ws.roomId;
+  if (!roomId) return;
 
-  const game = activeGames.get(ws.roomId);
+  const game = activeGames.get(roomId);
   if (!game) return;
+
+  // ❗ отменяем countdown если он был
+  if (roomCountdowns.has(roomId)) {
+    clearInterval(roomCountdowns.get(roomId));
+    roomCountdowns.delete(roomId);
+
+    broadcast(roomId, {
+      type: "countdown_cancelled"
+    });
+  }
 
   if (!game.disconnected) {
     game.disconnected = {};
@@ -1593,10 +1686,9 @@ if (data.type === "make_move") {
 
   setTimeout(() => {
 
-    if (!activeGames.has(ws.roomId)) return;
+    if (!activeGames.has(roomId)) return;
 
-    const currentGame = activeGames.get(ws.roomId);
-
+    const currentGame = activeGames.get(roomId);
     if (!currentGame.disconnected) return;
 
     const stillDisconnected =
@@ -1608,8 +1700,8 @@ if (data.type === "make_move") {
         .map(Number)
         .find(id => id !== ws.user.id);
 
-      finishGame(ws.roomId, opponentId);
-      cleanupGame(ws.roomId);
+      finishGame(roomId, opponentId);
+      cleanupGame(roomId);
     }
 
   }, 30000);

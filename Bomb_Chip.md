@@ -59,7 +59,20 @@ POST запрос для получения токена
 }
 }
 ```
-
+ОТ СЕРВЕРА
+```json
+{
+    "type": "user_customization",
+    "payload": {
+        "skin_id": 1,
+        "animation_id": 1,
+        "effect_id": 1,
+        "skin_code": "default_anim",
+        "animation_code": "default_anim",
+        "effect_code": "default_anim"
+    }
+}
+```
 ## Комнаты
 ### Список комнат
 От клиента
