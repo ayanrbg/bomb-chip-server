@@ -615,11 +615,26 @@ wss.on("connection", async (ws, req) => {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
+    
     ws.user = {
       id: decoded.id,
       nickname: decoded.nickname
     };
+    const balanceResult = await pool.query(
+    "SELECT balance FROM users WHERE id = $1",
+    [ws.user.id]
+  );
+
+  const balance = balanceResult.rows[0].balance;
+    // ✅ ОТПРАВЛЯЕМ УСПЕШНУЮ АВТОРИЗАЦИЮ
+      ws.send(JSON.stringify({
+        type: "authSuccess",
+        payload: {
+          userId: ws.user.id,
+          balance: balance,
+          nickname: ws.user.nickname
+        }
+      }));
     // 🔥 Отправляем кастомизацию игроку
     const customizationResult = await pool.query(`
       SELECT 
