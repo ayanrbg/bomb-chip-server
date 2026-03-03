@@ -66,10 +66,29 @@ app.post("/firebase-login", async (req, res) => {
       
       user = insert.rows[0];
 
-      await pool.query(
-  "INSERT INTO user_customization (user_id) VALUES ($1)",
-  [user.id]
-);
+      // Получаем случайный дефолтный скин
+const randomSkinResult = await pool.query(`
+  SELECT id FROM shop_items
+  WHERE code IN ('default_skin1','default_skin2','default_skin3')
+  ORDER BY RANDOM()
+  LIMIT 1
+`);
+if (randomSkinResult.rows.length === 0) {
+  throw new Error("No default skins found in shop_items");
+}
+const randomSkinId = randomSkinResult.rows[0].id;
+
+// Создаём кастомизацию с рандомным скином
+await pool.query(`
+  INSERT INTO user_customization 
+  (user_id, skin_id, animation_id, effect_id)
+  VALUES (
+    $1,
+    $2,
+    (SELECT id FROM shop_items WHERE code = 'default_anim'),
+    (SELECT id FROM shop_items WHERE code = 'deffault_effect')
+  )
+`, [user.id, randomSkinId]);
     } else {
       user = userResult.rows[0];
     }
@@ -116,7 +135,29 @@ app.post("/register", async (req, res) => {
     );
 
     const user = result.rows[0];
+    // Получаем случайный дефолтный скин
+const randomSkinResult = await pool.query(`
+  SELECT id FROM shop_items
+  WHERE code IN ('default_skin1','default_skin2','default_skin3')
+  ORDER BY RANDOM()
+  LIMIT 1
+`);
+if (randomSkinResult.rows.length === 0) {
+  throw new Error("No default skins found in shop_items");
+}
+const randomSkinId = randomSkinResult.rows[0].id;
 
+// Создаём кастомизацию
+await pool.query(`
+  INSERT INTO user_customization 
+  (user_id, skin_id, animation_id, effect_id)
+  VALUES (
+    $1,
+    $2,
+    (SELECT id FROM shop_items WHERE code = 'default_anim'),
+    (SELECT id FROM shop_items WHERE code = 'deffault_effect')
+  )
+`, [user.id, randomSkinId]);
     const token = jwt.sign(
       { id: user.id, nickname: user.nickname },
       process.env.JWT_SECRET,
