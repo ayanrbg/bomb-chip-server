@@ -86,7 +86,7 @@ await pool.query(`
     $1,
     $2,
     (SELECT id FROM shop_items WHERE code = 'default_anim'),
-    (SELECT id FROM shop_items WHERE code = 'deffault_effect')
+    (SELECT id FROM shop_items WHERE code = 'default_effect')
   )
 `, [user.id, randomSkinId]);
     } else {
@@ -111,53 +111,56 @@ app.get("/", (req, res) => {
   res.send("Server is running 🚀");
 });
 app.post("/register", async (req, res) => {
-  const { email, password, nickname } = req.body;
-
-  if (!email || !password || !nickname) {
-    return res.status(400).json({ error: "Missing fields" });
-  }
+  const client = await pool.connect();
 
   try {
-    const existing = await pool.query(
+    const { email, password, nickname } = req.body;
+
+    await client.query("BEGIN");
+
+    const existing = await client.query(
       "SELECT id FROM users WHERE email = $1",
       [email]
     );
 
     if (existing.rows.length > 0) {
+      await client.query("ROLLBACK");
       return res.status(400).json({ error: "Email already exists" });
     }
 
     const hashed = await bcrypt.hash(password, 10);
 
-    const result = await pool.query(
-      "INSERT INTO users (email, password, nickname) VALUES ($1,$2,$3) RETURNING id,nickname",
+    const result = await client.query(
+      `INSERT INTO users (email, password, nickname, balance)
+       VALUES ($1,$2,$3,1000)
+       RETURNING id,nickname`,
       [email, hashed, nickname]
     );
 
     const user = result.rows[0];
-    // Получаем случайный дефолтный скин
-const randomSkinResult = await pool.query(`
-  SELECT id FROM shop_items
-  WHERE code IN ('default_skin1','default_skin2','default_skin3')
-  ORDER BY RANDOM()
-  LIMIT 1
-`);
-if (randomSkinResult.rows.length === 0) {
-  throw new Error("No default skins found in shop_items");
-}
-const randomSkinId = randomSkinResult.rows[0].id;
 
-// Создаём кастомизацию
-await pool.query(`
-  INSERT INTO user_customization 
-  (user_id, skin_id, animation_id, effect_id)
-  VALUES (
-    $1,
-    $2,
-    (SELECT id FROM shop_items WHERE code = 'default_anim'),
-    (SELECT id FROM shop_items WHERE code = 'deffault_effect')
-  )
-`, [user.id, randomSkinId]);
+    const skinResult = await client.query(`
+      SELECT id FROM shop_items
+      WHERE code IN ('default_skin1','default_skin2','default_skin3')
+      ORDER BY RANDOM()
+      LIMIT 1
+    `);
+
+    const skinId = skinResult.rows[0].id;
+
+    await client.query(`
+      INSERT INTO user_customization
+      (user_id, skin_id, animation_id, effect_id)
+      VALUES (
+        $1,
+        $2,
+        (SELECT id FROM shop_items WHERE code = 'default_anim'),
+        (SELECT id FROM shop_items WHERE code = 'default_effect')
+      )
+    `, [user.id, skinId]);
+
+    await client.query("COMMIT");
+
     const token = jwt.sign(
       { id: user.id, nickname: user.nickname },
       process.env.JWT_SECRET,
@@ -167,8 +170,12 @@ await pool.query(`
     res.json({ token });
 
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error(err);
     res.status(500).json({ error: "Server error" });
+
+  } finally {
+    client.release();
   }
 });
 app.post("/login", async (req, res) => {
