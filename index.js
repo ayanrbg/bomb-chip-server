@@ -1043,8 +1043,14 @@ if (data.type === "get_rooms_list") {
     }));
   }
 
-  // Определяем куда записывать
-  
+  // 🔥 определяем колонку
+  const allowedColumns = {
+    skin: "skin_id",
+    animation: "animation_id",
+    effect: "effect_id"
+  };
+
+  const column = allowedColumns[item.type];
 
   if (!column) {
     return ws.send(JSON.stringify({
