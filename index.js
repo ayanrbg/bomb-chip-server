@@ -43,6 +43,7 @@ app.post("/firebase-login", async (req, res) => {
   }
 
   try {
+
     const decodedToken = await admin.auth().verifyIdToken(idToken);
 
     const firebaseUid = decodedToken.uid;
@@ -56,43 +57,71 @@ app.post("/firebase-login", async (req, res) => {
 
     let user;
 
+    // ===== ЕСЛИ ПОЛЬЗОВАТЕЛЯ НЕТ =====
     if (userResult.rows.length === 0) {
-      const insert = await pool.query(
-        `INSERT INTO users (email, nickname, firebase_uid, balance)
-         VALUES ($1, $2, $3, 1000)
-         RETURNING id, nickname`,
-        [email, name, firebaseUid]
-      );
-      
-      user = insert.rows[0];
 
-      // Получаем случайный дефолтный скин
-const randomSkinResult = await pool.query(`
-  SELECT id FROM shop_items
-  WHERE code IN ('default_skin1','default_skin2','default_skin3')
-  ORDER BY RANDOM()
-  LIMIT 1
-`);
-if (randomSkinResult.rows.length === 0) {
-  throw new Error("No default skins found in shop_items");
-}
-const randomSkinId = randomSkinResult.rows[0].id;
+      const client = await pool.connect();
 
-// Создаём кастомизацию с рандомным скином
-await pool.query(`
-  INSERT INTO user_customization 
-  (user_id, skin_id, animation_id, effect_id)
-  VALUES (
-    $1,
-    $2,
-    (SELECT id FROM shop_items WHERE code = 'default_anim'),
-    (SELECT id FROM shop_items WHERE code = 'default_effect')
-  )
-`, [user.id, randomSkinId]);
+      try {
+
+        await client.query("BEGIN");
+
+        const insert = await client.query(
+          `INSERT INTO users (email, nickname, firebase_uid, balance)
+           VALUES ($1, $2, $3, 1000)
+           RETURNING id, nickname`,
+          [email, name, firebaseUid]
+        );
+
+        user = insert.rows[0];
+
+        // случайный дефолтный скин
+        const randomSkinResult = await client.query(`
+          SELECT id FROM shop_items
+          WHERE code IN ('default_skin1','default_skin2','default_skin3')
+          ORDER BY RANDOM()
+          LIMIT 1
+        `);
+
+        if (randomSkinResult.rows.length === 0) {
+          throw new Error("No default skins found");
+        }
+
+        const randomSkinId = randomSkinResult.rows[0].id;
+
+        // создаём кастомизацию
+        await client.query(`
+          INSERT INTO user_customization
+          (user_id, skin_id, animation_id, effect_id)
+          VALUES (
+            $1,
+            $2,
+            (SELECT id FROM shop_items WHERE code = 'default_anim'),
+            (SELECT id FROM shop_items WHERE code = 'default_effect')
+          )
+        `, [user.id, randomSkinId]);
+
+        await client.query("COMMIT");
+
+      } catch (err) {
+
+        await client.query("ROLLBACK");
+        throw err;
+
+      } finally {
+
+        client.release();
+
+      }
+
     } else {
+
+      // ===== ПОЛЬЗОВАТЕЛЬ УЖЕ ЕСТЬ =====
       user = userResult.rows[0];
+
     }
 
+    // ===== СОЗДАЁМ JWT =====
     const token = jwt.sign(
       { id: user.id, nickname: user.nickname },
       process.env.JWT_SECRET,
@@ -102,8 +131,10 @@ await pool.query(`
     res.json({ token });
 
   } catch (err) {
+
     console.error(err);
     res.status(401).json({ error: "Invalid Firebase token" });
+
   }
 });
 // ===== HTTP: Проверка сервера =====
@@ -644,18 +675,38 @@ wss.on("connection", async (ws, req) => {
       }));
     // 🔥 Отправляем кастомизацию игроку
     const customizationResult = await pool.query(`
-      SELECT 
-        uc.skin_id,
-        uc.animation_id,
-        uc.effect_id,
-        s1.code as skin_code,
-        s2.code as animation_code,
-        s3.code as effect_code
-      FROM user_customization uc
-      LEFT JOIN shop_items s1 ON uc.skin_id = s1.id
-      LEFT JOIN shop_items s2 ON uc.animation_id = s2.id
-      LEFT JOIN shop_items s3 ON uc.effect_id = s3.id
-      WHERE uc.user_id = $1
+    SELECT 
+      uc.skin_id,
+      uc.animation_id,
+      uc.effect_id,
+
+      s1.code as skin_code,
+      s2.code as animation_code,
+      s3.code as effect_code,
+
+      (
+        SELECT COUNT(*) 
+        FROM shop_items 
+        WHERE type='skin' AND id <= uc.skin_id
+      ) as skin_index,
+
+      (
+        SELECT COUNT(*) 
+        FROM shop_items 
+        WHERE type='animation' AND id <= uc.animation_id
+      ) as animation_index,
+
+      (
+        SELECT COUNT(*) 
+        FROM shop_items 
+        WHERE type='effect' AND id <= uc.effect_id
+      ) as effect_index
+
+    FROM user_customization uc
+    LEFT JOIN shop_items s1 ON uc.skin_id = s1.id
+    LEFT JOIN shop_items s2 ON uc.animation_id = s2.id
+    LEFT JOIN shop_items s3 ON uc.effect_id = s3.id
+    WHERE uc.user_id = $1
     `, [ws.user.id]);
 
     ws.send(JSON.stringify({
@@ -993,13 +1044,7 @@ if (data.type === "get_rooms_list") {
   }
 
   // Определяем куда записывать
-  const allowedColumns = {
-    skin: "skin_id",
-    animation: "animation_id",
-    effect: "effect_id"
-  };
-
-  const column = allowedColumns[item.type];
+  
 
   if (!column) {
     return ws.send(JSON.stringify({
@@ -1007,8 +1052,6 @@ if (data.type === "get_rooms_list") {
       message: "Invalid item type"
     }));
   }
-
-  if (!column) return;
 
   await pool.query(
     `UPDATE user_customization 
