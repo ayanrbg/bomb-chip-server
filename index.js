@@ -147,6 +147,21 @@ app.post("/register", async (req, res) => {
   try {
     const { email, password, nickname } = req.body;
 
+    if (!email || typeof email !== "string" || !email.includes("@") || email.length > 255) {
+      client.release();
+      return res.status(400).json({ error: "Invalid email" });
+    }
+
+    if (!password || typeof password !== "string" || password.length < 6 || password.length > 128) {
+      client.release();
+      return res.status(400).json({ error: "Password must be 6-128 characters" });
+    }
+
+    if (!nickname || typeof nickname !== "string" || nickname.trim().length < 1 || nickname.length > 30) {
+      client.release();
+      return res.status(400).json({ error: "Nickname must be 1-30 characters" });
+    }
+
     await client.query("BEGIN");
 
     const existing = await client.query(
@@ -211,6 +226,10 @@ app.post("/register", async (req, res) => {
 });
 app.post("/login", async (req, res) => {
   const { email, password } = req.body;
+
+  if (!email || typeof email !== "string" || !password || typeof password !== "string") {
+    return res.status(400).json({ error: "Email and password required" });
+  }
 
   try {
     const result = await pool.query(
@@ -350,7 +369,7 @@ function cleanupGame(roomId) {
 
   activeGames.delete(roomId);
 }
-function autoMove(roomId) {
+async function autoMove(roomId) {
 
   const game = activeGames.get(roomId);
   if (!game) return;
@@ -389,7 +408,10 @@ function autoMove(roomId) {
       payload: result
     });
 
-    if (!result.winner) {
+    if (result.winner) {
+      await finishGame(roomId, result.winner);
+      cleanupGame(roomId);
+    } else {
       startMoveTimer(roomId);
     }
 
@@ -663,6 +685,11 @@ wss.on("connection", async (ws, req) => {
     [ws.user.id]
   );
 
+  if (balanceResult.rows.length === 0) {
+    ws.close();
+    return;
+  }
+
   const balance = balanceResult.rows[0].balance;
     // ✅ ОТПРАВЛЯЕМ УСПЕШНУЮ АВТОРИЗАЦИЮ
       ws.send(JSON.stringify({
@@ -747,47 +774,61 @@ wss.on("connection", async (ws, req) => {
       }));
     }
     if (data.type === "create_room") {
-  try {
-    const { bet , password} = data;
+  // Проверка: уже в комнате?
+  if (ws.roomId) {
+    return ws.send(JSON.stringify({
+      type: "error",
+      message: "You are already in a room"
+    }));
+  }
 
-    if (!bet || bet <= 0) {
+  const client = await pool.connect();
+  try {
+    const { bet, password } = data;
+
+    if (!bet || typeof bet !== "number" || !Number.isFinite(bet) || bet <= 0 || !Number.isInteger(bet)) {
+      client.release();
       return ws.send(JSON.stringify({
         type: "error",
         message: "Invalid bet amount"
       }));
     }
 
-    // проверяем баланс
-    const userResult = await pool.query(
-      "SELECT balance FROM users WHERE id = $1",
+    await client.query("BEGIN");
+
+    // проверяем и списываем баланс атомарно
+    const userResult = await client.query(
+      "SELECT balance FROM users WHERE id = $1 FOR UPDATE",
       [ws.user.id]
     );
 
     const balance = userResult.rows[0].balance;
 
     if (balance < bet) {
+      await client.query("ROLLBACK");
+      client.release();
       return ws.send(JSON.stringify({
         type: "error",
         message: "Not enough balance"
       }));
     }
 
-    // блокируем деньги (списываем)
-    await pool.query(
+    await client.query(
       "UPDATE users SET balance = balance - $1 WHERE id = $2",
       [bet, ws.user.id]
     );
+
     let passwordHash = null;
+    if (password) {
+      passwordHash = await bcrypt.hash(password, 10);
+    }
 
-  if (password) {
-    passwordHash = await bcrypt.hash(password, 10);
-  }
-    // создаём комнату
-    const result = await pool.query(
-    "INSERT INTO rooms (host_id, bet, host_ready, guest_ready, password_hash) VALUES ($1,$2,false,false,$3) RETURNING *",
-    [ws.user.id, bet, passwordHash]
-  );
+    const result = await client.query(
+      "INSERT INTO rooms (host_id, bet, host_ready, guest_ready, password_hash) VALUES ($1,$2,false,false,$3) RETURNING id, host_id, bet, status, host_ready, guest_ready, created_at",
+      [ws.user.id, bet, passwordHash]
+    );
 
+    await client.query("COMMIT");
 
     const room = result.rows[0];
     ws.roomId = room.id;
@@ -800,17 +841,29 @@ wss.on("connection", async (ws, req) => {
     await broadcastRoomInfo(room.id);
 
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error(err);
     ws.send(JSON.stringify({
       type: "error",
       message: "Failed to create room"
     }));
+  } finally {
+    client.release();
   }
 }
 
   if (data.type === "join_room") {
+  // Проверка: уже в комнате?
+  if (ws.roomId) {
+    return ws.send(JSON.stringify({
+      type: "error",
+      message: "You are already in a room"
+    }));
+  }
+
+  const client = await pool.connect();
   try {
-    const { roomId , password} = data;
+    const { roomId, password } = data;
 
     const roomResult = await pool.query(
       "SELECT * FROM rooms WHERE id = $1",
@@ -818,6 +871,7 @@ wss.on("connection", async (ws, req) => {
     );
 
     if (roomResult.rows.length === 0) {
+      client.release();
       return ws.send(JSON.stringify({
         type: "error",
         message: "Room not found"
@@ -825,46 +879,50 @@ wss.on("connection", async (ws, req) => {
     }
 
     const room = roomResult.rows[0];
-    // 🔐 Проверка пароля
-if (room.password_hash) {
 
-  if (!password) {
-    return ws.send(JSON.stringify({
-      type: "error",
-      message: "Room requires password"
-    }));
-  }
+    // Проверка пароля
+    if (room.password_hash) {
+      if (!password) {
+        client.release();
+        return ws.send(JSON.stringify({
+          type: "error",
+          message: "Room requires password"
+        }));
+      }
 
-  const validPassword = await bcrypt.compare(
-    password,
-    room.password_hash
-  );
+      const validPassword = await bcrypt.compare(password, room.password_hash);
+      if (!validPassword) {
+        client.release();
+        return ws.send(JSON.stringify({
+          type: "error",
+          message: "Wrong password"
+        }));
+      }
+    }
 
-  if (!validPassword) {
-    return ws.send(JSON.stringify({
-      type: "error",
-      message: "Wrong password"
-    }));
-  }
-}
     // анти-дубль
     if (room.host_id === ws.user.id || room.guest_id === ws.user.id) {
       ws.roomId = roomId;
+      client.release();
       return ws.send(JSON.stringify({
         type: "error",
         message: "You are already in this room"
       }));
     }
 
-    // проверяем баланс
-    const userResult = await pool.query(
-      "SELECT balance FROM users WHERE id = $1",
+    await client.query("BEGIN");
+
+    // проверяем и списываем баланс атомарно
+    const userResult = await client.query(
+      "SELECT balance FROM users WHERE id = $1 FOR UPDATE",
       [ws.user.id]
     );
 
     const balance = userResult.rows[0].balance;
 
     if (balance < room.bet) {
+      await client.query("ROLLBACK");
+      client.release();
       return ws.send(JSON.stringify({
         type: "error",
         message: "Not enough balance"
@@ -872,30 +930,33 @@ if (room.password_hash) {
     }
 
     // атомарно пробуем занять слот
-    const updateResult = await pool.query(
-    `UPDATE rooms 
-    SET guest_id = $1,
-        status = 'waiting',
-        host_ready = false,
-        guest_ready = false
-    WHERE id = $2 AND guest_id IS NULL
-    RETURNING *`,
-    [ws.user.id, roomId]
-  );
-
+    const updateResult = await client.query(
+      `UPDATE rooms
+       SET guest_id = $1,
+           status = 'waiting',
+           host_ready = false,
+           guest_ready = false
+       WHERE id = $2 AND guest_id IS NULL
+       RETURNING *`,
+      [ws.user.id, roomId]
+    );
 
     if (updateResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      client.release();
       return ws.send(JSON.stringify({
         type: "error",
         message: "Room is full"
       }));
     }
 
-    // списываем деньги ТОЛЬКО если успешно заняли слот
-    await pool.query(
+    // списываем деньги внутри той же транзакции
+    await client.query(
       "UPDATE users SET balance = balance - $1 WHERE id = $2",
       [room.bet, ws.user.id]
     );
+
+    await client.query("COMMIT");
 
     ws.roomId = roomId;
 
@@ -905,18 +966,21 @@ if (room.password_hash) {
     }));
 
     await broadcastRoomInfo(roomId);
-    // если теперь в комнате 2 игрока
+
     if (updateResult.rows[0].guest_id) {
       broadcast(roomId, {
         type: "play_request"
       });
     }
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error(err);
     ws.send(JSON.stringify({
       type: "error",
       message: "Failed to join room"
     }));
+  } finally {
+    client.release();
   }
 }
 if (data.type === "get_rooms_list") {
@@ -1091,6 +1155,19 @@ if (data.type === "buy_item") {
     }));
   }
 
+  // Проверка: уже куплен?
+  const alreadyOwned = await pool.query(
+    "SELECT 1 FROM user_items WHERE user_id = $1 AND item_id = $2",
+    [ws.user.id, itemId]
+  );
+
+  if (alreadyOwned.rows.length > 0) {
+    return ws.send(JSON.stringify({
+      type: "error",
+      message: "Item already owned"
+    }));
+  }
+
   const client = await pool.connect();
 
   try {
@@ -1118,7 +1195,7 @@ if (data.type === "buy_item") {
     );
 
     await client.query(
-      "INSERT INTO user_items (user_id, item_id) VALUES ($1,$2)",
+      "INSERT INTO user_items (user_id, item_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
       [ws.user.id, itemId]
     );
 
@@ -1330,45 +1407,50 @@ if (data.type === "invite_to_room") {
           ? room.guest_id
           : room.host_id;
 
-      if (winnerId) {
-        // начисляем победителю bet * 2
-        await pool.query(
-          "UPDATE users SET balance = balance + $1 WHERE id = $2",
-          [room.bet * 2, winnerId]
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+
+        if (winnerId) {
+          await client.query(
+            "UPDATE users SET balance = balance + $1 WHERE id = $2",
+            [room.bet * 2, winnerId]
+          );
+        }
+
+        await client.query(
+          "DELETE FROM rooms WHERE id = $1",
+          [roomId]
         );
+
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      } finally {
+        client.release();
       }
 
-      // удаляем комнату
-      await pool.query(
-        "DELETE FROM rooms WHERE id = $1",
-        [roomId]
-      );
-
       // уведомляем победителя
-      wss.clients.forEach(client => {
-        if (
-          client.readyState === 1 &&
-          client.user?.id === winnerId
-        ) {
-          client.send(JSON.stringify({
+      wss.clients.forEach(c => {
+        if (c.readyState === 1 && c.user?.id === winnerId) {
+          c.send(JSON.stringify({
             type: "game_finished",
             payload: {
               winnerId,
               reason: "opponent_left"
             }
           }));
-
-          client.roomId = null;
+          c.roomId = null;
         }
       });
+
       if (roomCountdowns.has(roomId)) {
         clearInterval(roomCountdowns.get(roomId));
         roomCountdowns.delete(roomId);
-
-        broadcast(roomId, {
-          type: "countdown_cancelled"
-        });
+        broadcast(roomId, { type: "countdown_cancelled" });
       }
+
       ws.roomId = null;
       cleanupGame(roomId);
       return ws.send(JSON.stringify({
@@ -1377,30 +1459,41 @@ if (data.type === "invite_to_room") {
     }
 
     // ===== ЕСЛИ ИГРА НЕ НАЧАЛАСЬ =====
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
 
-    // возвращаем деньги вышедшему
-    await pool.query(
-      "UPDATE users SET balance = balance + $1 WHERE id = $2",
-      [room.bet, ws.user.id]
-    );
+      // возвращаем деньги вышедшему
+      await client.query(
+        "UPDATE users SET balance = balance + $1 WHERE id = $2",
+        [room.bet, ws.user.id]
+      );
 
-    if (room.host_id === ws.user.id) {
-      if (room.guest_id) {
-        await pool.query(
-          "UPDATE rooms SET host_id = $1, guest_id = NULL, status = 'waiting' WHERE id = $2",
-          [room.guest_id, roomId]
-        );
-      } else {
-        await pool.query(
-          "DELETE FROM rooms WHERE id = $1",
+      if (room.host_id === ws.user.id) {
+        if (room.guest_id) {
+          await client.query(
+            "UPDATE rooms SET host_id = $1, guest_id = NULL, status = 'waiting' WHERE id = $2",
+            [room.guest_id, roomId]
+          );
+        } else {
+          await client.query(
+            "DELETE FROM rooms WHERE id = $1",
+            [roomId]
+          );
+        }
+      } else if (room.guest_id === ws.user.id) {
+        await client.query(
+          "UPDATE rooms SET guest_id = NULL, status = 'waiting' WHERE id = $1",
           [roomId]
         );
       }
-    } else if (room.guest_id === ws.user.id) {
-      await pool.query(
-        "UPDATE rooms SET guest_id = NULL, status = 'waiting' WHERE id = $1",
-        [roomId]
-      );
+
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
     }
 
     ws.roomId = null;
@@ -1609,6 +1702,14 @@ if (data.type === "kick_player") {
 }
 if (data.type === "place_bombs") {
 
+  if (!Array.isArray(data.bombs) || data.bombs.length !== 3
+      || !data.bombs.every(b => Number.isInteger(b) && b >= 0 && b <= 11)) {
+    return ws.send(JSON.stringify({
+      type: "error",
+      message: "Invalid bombs: must be 3 integers 0-11"
+    }));
+  }
+
   const game = activeGames.get(ws.roomId);
   if (!game) return;
 
@@ -1689,6 +1790,14 @@ if (data.type === "place_bombs") {
 // }
 if (data.type === "make_move") {
 
+  const cell = Number(data.cell);
+  if (!Number.isInteger(cell) || cell < 0 || cell > 11) {
+    return ws.send(JSON.stringify({
+      type: "error",
+      message: "Invalid cell"
+    }));
+  }
+
   const game = activeGames.get(ws.roomId);
   if (!game) return;
 
@@ -1697,7 +1806,7 @@ if (data.type === "make_move") {
 
   try {
 
-    const result = game.makeMove(ws.user.id, data.cell);
+    const result = game.makeMove(ws.user.id, cell);
 
     if (result.error) {
       ws.send(JSON.stringify({
@@ -1731,24 +1840,79 @@ if (data.type === "make_move") {
   }
 });
 
-  ws.on("close", () => {
+  ws.on("close", async () => {
 
   const roomId = ws.roomId;
   if (!roomId) return;
 
-  const game = activeGames.get(roomId);
-  if (!game) return;
-
-  // ❗ отменяем countdown если он был
+  // отменяем countdown если он был
   if (roomCountdowns.has(roomId)) {
     clearInterval(roomCountdowns.get(roomId));
     roomCountdowns.delete(roomId);
-
-    broadcast(roomId, {
-      type: "countdown_cancelled"
-    });
+    broadcast(roomId, { type: "countdown_cancelled" });
   }
 
+  const game = activeGames.get(roomId);
+
+  // ===== Дисконнект из WAITING-комнаты (нет активной игры) =====
+  if (!game) {
+    try {
+      const roomResult = await pool.query(
+        "SELECT * FROM rooms WHERE id = $1",
+        [roomId]
+      );
+
+      if (roomResult.rows.length === 0) return;
+
+      const room = roomResult.rows[0];
+
+      // Если статус уже playing — не трогаем (игра управляется через activeGames)
+      if (room.status === "playing") return;
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+
+        // Возвращаем ставку отключившемуся
+        await client.query(
+          "UPDATE users SET balance = balance + $1 WHERE id = $2",
+          [room.bet, ws.user.id]
+        );
+
+        if (room.host_id === ws.user.id) {
+          if (room.guest_id) {
+            // Гость становится хостом
+            await client.query(
+              "UPDATE rooms SET host_id = $1, guest_id = NULL, host_ready = false, guest_ready = false, status = 'waiting' WHERE id = $2",
+              [room.guest_id, roomId]
+            );
+          } else {
+            // Комната пуста — удаляем
+            await client.query("DELETE FROM rooms WHERE id = $1", [roomId]);
+          }
+        } else if (room.guest_id === ws.user.id) {
+          await client.query(
+            "UPDATE rooms SET guest_id = NULL, guest_ready = false, status = 'waiting' WHERE id = $1",
+            [roomId]
+          );
+        }
+
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK");
+        console.error("disconnect from waiting room error:", err);
+      } finally {
+        client.release();
+      }
+
+      await broadcastRoomInfo(roomId);
+    } catch (err) {
+      console.error("disconnect handler error:", err);
+    }
+    return;
+  }
+
+  // ===== Дисконнект из АКТИВНОЙ ИГРЫ =====
   if (!game.disconnected) {
     game.disconnected = {};
   }
@@ -1762,11 +1926,9 @@ if (data.type === "make_move") {
     const currentGame = activeGames.get(roomId);
     if (!currentGame.disconnected) return;
 
-    const stillDisconnected =
-      currentGame.disconnected[ws.user.id];
+    const stillDisconnected = currentGame.disconnected[ws.user.id];
 
     if (stillDisconnected) {
-
       const opponentId = Object.keys(currentGame.players)
         .map(Number)
         .find(id => id !== ws.user.id);
