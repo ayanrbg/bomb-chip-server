@@ -9,6 +9,14 @@ import { GameEngine } from "./gameEngine.js";
 
 const activeGames = new Map();
 const roomCountdowns = new Map();
+
+// ===== Матчмейкинг =====
+// matchmakingQueue = Map<arenaId, Map<bet, Array<{ws, userId, joinedAt}>>>
+const matchmakingQueue = new Map();
+// Track which users are in the queue: userId -> {arenaId, bet}
+const userInQueue = new Map();
+// Debounce timer for arena_queue_update broadcast
+let arenaQueueBroadcastTimer = null;
 import express from "express";
 import http from "http";
 import { WebSocketServer } from "ws";
@@ -92,12 +100,15 @@ app.post("/firebase-login", async (req, res) => {
         // создаём кастомизацию
         await client.query(`
           INSERT INTO user_customization
-          (user_id, skin_id, animation_id, effect_id)
+          (user_id, skin_id, effect_id, animation_hit_id, animation_miss_id, animation_win_id, animation_lose_id)
           VALUES (
             $1,
             $2,
-            (SELECT id FROM shop_items WHERE code = 'default_anim'),
-            (SELECT id FROM shop_items WHERE code = 'default_effect')
+            (SELECT id FROM shop_items WHERE code = 'default_effect'),
+            (SELECT id FROM shop_items WHERE code = 'default_anim' LIMIT 1),
+            (SELECT id FROM shop_items WHERE code = 'default_anim_miss' LIMIT 1),
+            (SELECT id FROM shop_items WHERE code = 'default_anim_win' LIMIT 1),
+            (SELECT id FROM shop_items WHERE code = 'default_anim_lose' LIMIT 1)
           )
         `, [user.id, randomSkinId]);
 
@@ -196,12 +207,15 @@ app.post("/register", async (req, res) => {
 
     await client.query(`
       INSERT INTO user_customization
-      (user_id, skin_id, animation_id, effect_id)
+      (user_id, skin_id, effect_id, animation_hit_id, animation_miss_id, animation_win_id, animation_lose_id)
       VALUES (
         $1,
         $2,
-        (SELECT id FROM shop_items WHERE code = 'default_anim'),
-        (SELECT id FROM shop_items WHERE code = 'default_effect')
+        (SELECT id FROM shop_items WHERE code = 'default_effect'),
+        (SELECT id FROM shop_items WHERE code = 'default_anim' LIMIT 1),
+        (SELECT id FROM shop_items WHERE code = 'default_anim_miss' LIMIT 1),
+        (SELECT id FROM shop_items WHERE code = 'default_anim_win' LIMIT 1),
+        (SELECT id FROM shop_items WHERE code = 'default_anim_lose' LIMIT 1)
       )
     `, [user.id, skinId]);
 
@@ -274,7 +288,7 @@ async function finishGame(roomId, winnerId) {
     await client.query("BEGIN");
 
     const roomResult = await client.query(
-      "SELECT * FROM rooms WHERE id = $1 FOR UPDATE",
+      "SELECT r.*, a.code as arena_code FROM rooms r LEFT JOIN arenas a ON r.arena_id = a.id WHERE r.id = $1 FOR UPDATE",
       [roomId]
     );
 
@@ -285,6 +299,10 @@ async function finishGame(roomId, winnerId) {
 
     const room = roomResult.rows[0];
     const totalPrize = room.bet * 2;
+
+    // Determine loserId
+    const playerIds = Object.keys(game.players).map(Number);
+    const loserId = playerIds.find(id => id !== Number(winnerId));
 
     await client.query(
       "UPDATE users SET balance = balance + $1 WHERE id = $2",
@@ -298,12 +316,24 @@ async function finishGame(roomId, winnerId) {
 
     await client.query("COMMIT");
 
+    // Build finish animations
+    const animations = game.getFinishAnimations(winnerId, loserId);
+
+    const payload = {
+      winnerId,
+      loserId,
+      prize: totalPrize,
+      animations
+    };
+
+    if (room.arena_id) {
+      payload.arenaId = room.arena_id;
+      payload.arenaCode = room.arena_code;
+    }
+
     broadcast(roomId, {
       type: "game_finished",
-      payload: {
-        winnerId,
-        prize: totalPrize
-      }
+      payload
     });
 
   } catch (err) {
@@ -401,7 +431,8 @@ async function autoMove(roomId) {
     const randomCell =
       available[Math.floor(Math.random() * available.length)];
 
-    const result = game.makeMove(game.turn, randomCell);
+    const movingPlayerId = game.turn;
+    const result = game.makeMove(movingPlayerId, randomCell);
 
     broadcast(roomId, {
       type: "move_result",
@@ -484,6 +515,190 @@ function startGameCountdown(roomId) {
 
   roomCountdowns.set(roomId, interval);
 }
+// ===== Matchmaking functions =====
+
+function getQueueCounts() {
+  const counts = [];
+  for (const [arenaId, betMap] of matchmakingQueue) {
+    let total = 0;
+    for (const players of betMap.values()) {
+      total += players.length;
+    }
+    counts.push({ arenaId, players_in_queue: total });
+  }
+  return counts;
+}
+
+function broadcastArenaQueueUpdate() {
+  if (arenaQueueBroadcastTimer) return; // debounce: max once per 2 seconds
+  arenaQueueBroadcastTimer = setTimeout(() => {
+    arenaQueueBroadcastTimer = null;
+
+    const counts = getQueueCounts();
+    const msg = JSON.stringify({
+      type: "arena_queue_update",
+      payload: counts
+    });
+
+    wss.clients.forEach(client => {
+      if (client.readyState === 1 && !client.roomId && !userInQueue.has(client.user?.id)) {
+        client.send(msg);
+      }
+    });
+  }, 2000);
+}
+
+function removeFromQueue(userId) {
+  const info = userInQueue.get(userId);
+  if (!info) return null;
+
+  const { arenaId, bet } = info;
+  const betMap = matchmakingQueue.get(arenaId);
+  if (betMap) {
+    const players = betMap.get(bet);
+    if (players) {
+      const idx = players.findIndex(p => p.userId === userId);
+      if (idx !== -1) {
+        players.splice(idx, 1);
+        if (players.length === 0) betMap.delete(bet);
+        if (betMap.size === 0) matchmakingQueue.delete(arenaId);
+      }
+    }
+  }
+
+  userInQueue.delete(userId);
+  broadcastArenaQueueUpdate();
+  return info;
+}
+
+async function loadPlayerCustomization(playerId) {
+  const result = await pool.query(`
+    SELECT
+      s_skin.code as skin_code,
+      s_effect.code as effect_code,
+      s_hit.code as animation_hit_code,
+      s_miss.code as animation_miss_code,
+      s_win.code as animation_win_code,
+      s_lose.code as animation_lose_code
+    FROM user_customization uc
+    LEFT JOIN shop_items s_skin ON uc.skin_id = s_skin.id
+    LEFT JOIN shop_items s_effect ON uc.effect_id = s_effect.id
+    LEFT JOIN shop_items s_hit ON uc.animation_hit_id = s_hit.id
+    LEFT JOIN shop_items s_miss ON uc.animation_miss_id = s_miss.id
+    LEFT JOIN shop_items s_win ON uc.animation_win_id = s_win.id
+    LEFT JOIN shop_items s_lose ON uc.animation_lose_id = s_lose.id
+    WHERE uc.user_id = $1
+  `, [playerId]);
+
+  return result.rows[0] || {
+    skin_code: "default_skin1",
+    effect_code: "default_effect",
+    animation_hit_code: "default_anim",
+    animation_miss_code: "default_anim_miss",
+    animation_win_code: "default_anim_win",
+    animation_lose_code: "default_anim_lose"
+  };
+}
+
+async function createMatchRoom(player1, player2, arenaId, bet) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const roomResult = await client.query(
+      `INSERT INTO rooms (host_id, guest_id, bet, status, host_ready, guest_ready, arena_id)
+       VALUES ($1, $2, $3, 'playing', true, true, $4)
+       RETURNING id`,
+      [player1.userId, player2.userId, bet, arenaId]
+    );
+
+    await client.query("COMMIT");
+
+    const roomId = roomResult.rows[0].id;
+
+    // Set roomId on both WS connections
+    player1.ws.roomId = roomId;
+    player2.ws.roomId = roomId;
+
+    // Load customization for both players
+    const [custom1, custom2] = await Promise.all([
+      loadPlayerCustomization(player1.userId),
+      loadPlayerCustomization(player2.userId)
+    ]);
+
+    // Get arena info
+    const arenaResult = await pool.query(
+      "SELECT code, name FROM arenas WHERE id = $1",
+      [arenaId]
+    );
+    const arena = arenaResult.rows[0];
+
+    // Send match_found to both
+    player1.ws.send(JSON.stringify({
+      type: "match_found",
+      payload: {
+        roomId,
+        arenaId,
+        arenaCode: arena.code,
+        bet,
+        opponent: {
+          id: player2.userId,
+          nickname: player2.ws.user.nickname,
+          skin_code: custom2.skin_code,
+          animation_code: custom2.animation_hit_code,
+          effect_code: custom2.effect_code
+        }
+      }
+    }));
+
+    player2.ws.send(JSON.stringify({
+      type: "match_found",
+      payload: {
+        roomId,
+        arenaId,
+        arenaCode: arena.code,
+        bet,
+        opponent: {
+          id: player1.userId,
+          nickname: player1.ws.user.nickname,
+          skin_code: custom1.skin_code,
+          animation_code: custom1.animation_hit_code,
+          effect_code: custom1.effect_code
+        }
+      }
+    }));
+
+    // Create game engine and set customization
+    const game = new GameEngine(roomId, player1.userId, player2.userId);
+    game.setCustomization(player1.userId, custom1);
+    game.setCustomization(player2.userId, custom2);
+    activeGames.set(roomId, game);
+
+    // Auto-start countdown (no ready phase needed)
+    startGameCountdown(roomId);
+
+    broadcastArenaQueueUpdate();
+
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("createMatchRoom error:", err);
+
+    // Refund both players on error
+    try {
+      await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [bet, player1.userId]);
+      await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [bet, player2.userId]);
+    } catch (refundErr) {
+      console.error("Refund error:", refundErr);
+    }
+
+    const errorMsg = JSON.stringify({ type: "error", message: "Failed to create match" });
+    if (player1.ws.readyState === 1) player1.ws.send(errorMsg);
+    if (player2.ws.readyState === 1) player2.ws.send(errorMsg);
+  } finally {
+    client.release();
+  }
+}
+
 async function launchGame(roomId) {
 
   const roomResult = await pool.query(
@@ -495,13 +710,26 @@ async function launchGame(roomId) {
 
   const room = roomResult.rows[0];
 
-  // ❗ ЗАЩИТА №1 — должны быть оба игрока
+  // ЗАЩИТА №1 — должны быть оба игрока
   if (!room.host_id || !room.guest_id) return;
 
-  // ❗ ЗАЩИТА №2 — оба должны быть ready
+  // For matchmaking rooms (arena_id set), skip ready check — already playing
+  if (room.arena_id) {
+    // Matchmaking rooms are already set to 'playing' and have game engine created
+    // This is called from countdown, just start the game phase
+    const game = activeGames.get(roomId);
+    if (!game) return;
+
+    broadcast(roomId, { type: "game_started" });
+    broadcast(roomId, { type: "request_bombs" });
+    startBombsTimer(roomId);
+    return;
+  }
+
+  // ЗАЩИТА №2 — оба должны быть ready (only for private rooms)
   if (!room.host_ready || !room.guest_ready) return;
 
-  // ❗ ЗАЩИТА №3 — не запускать повторно
+  // ЗАЩИТА №3 — не запускать повторно
   if (room.status === "playing") return;
 
   await pool.query(
@@ -514,6 +742,14 @@ async function launchGame(roomId) {
     room.host_id,
     room.guest_id
   );
+
+  // Load customization for private room players too
+  const [custom1, custom2] = await Promise.all([
+    loadPlayerCustomization(room.host_id),
+    loadPlayerCustomization(room.guest_id)
+  ]);
+  game.setCustomization(room.host_id, custom1);
+  game.setCustomization(room.guest_id, custom2);
 
   activeGames.set(roomId, game);
 
@@ -700,39 +936,42 @@ wss.on("connection", async (ws, req) => {
           nickname: ws.user.nickname
         }
       }));
-    // 🔥 Отправляем кастомизацию игроку
+    // Отправляем кастомизацию игроку (6 слотов)
     const customizationResult = await pool.query(`
-    SELECT 
+    SELECT
       uc.skin_id,
-      uc.animation_id,
       uc.effect_id,
+      uc.animation_hit_id,
+      uc.animation_miss_id,
+      uc.animation_win_id,
+      uc.animation_lose_id,
 
-      s1.code as skin_code,
-      s2.code as animation_code,
-      s3.code as effect_code,
+      s_skin.code as skin_code,
+      s_effect.code as effect_code,
+      s_hit.code as animation_hit_code,
+      s_miss.code as animation_miss_code,
+      s_win.code as animation_win_code,
+      s_lose.code as animation_lose_code,
 
       (
-        SELECT COUNT(*) 
-        FROM shop_items 
+        SELECT COUNT(*)
+        FROM shop_items
         WHERE type='skin' AND id <= uc.skin_id
       ) as skin_index,
 
       (
-        SELECT COUNT(*) 
-        FROM shop_items 
-        WHERE type='animation' AND id <= uc.animation_id
-      ) as animation_index,
-
-      (
-        SELECT COUNT(*) 
-        FROM shop_items 
+        SELECT COUNT(*)
+        FROM shop_items
         WHERE type='effect' AND id <= uc.effect_id
       ) as effect_index
 
     FROM user_customization uc
-    LEFT JOIN shop_items s1 ON uc.skin_id = s1.id
-    LEFT JOIN shop_items s2 ON uc.animation_id = s2.id
-    LEFT JOIN shop_items s3 ON uc.effect_id = s3.id
+    LEFT JOIN shop_items s_skin ON uc.skin_id = s_skin.id
+    LEFT JOIN shop_items s_effect ON uc.effect_id = s_effect.id
+    LEFT JOIN shop_items s_hit ON uc.animation_hit_id = s_hit.id
+    LEFT JOIN shop_items s_miss ON uc.animation_miss_id = s_miss.id
+    LEFT JOIN shop_items s_win ON uc.animation_win_id = s_win.id
+    LEFT JOIN shop_items s_lose ON uc.animation_lose_id = s_lose.id
     WHERE uc.user_id = $1
     `, [ws.user.id]);
 
@@ -773,7 +1012,256 @@ wss.on("connection", async (ws, req) => {
         payload: result.rows[0]
       }));
     }
+
+    // ===== Арены =====
+    if (data.type === "get_arenas") {
+      try {
+        const result = await pool.query(
+          "SELECT id, code, name, min_bet, max_bet FROM arenas WHERE is_active = true ORDER BY sort_order"
+        );
+
+        const arenas = result.rows.map(arena => {
+          let playersInQueue = 0;
+          const betMap = matchmakingQueue.get(arena.id);
+          if (betMap) {
+            for (const players of betMap.values()) {
+              playersInQueue += players.length;
+            }
+          }
+          return {
+            ...arena,
+            players_in_queue: playersInQueue
+          };
+        });
+
+        ws.send(JSON.stringify({
+          type: "arenas_list",
+          payload: arenas
+        }));
+      } catch (err) {
+        console.error(err);
+        ws.send(JSON.stringify({ type: "error", message: "Failed to fetch arenas" }));
+      }
+    }
+
+    // ===== Матчмейкинг: Найти игру =====
+    if (data.type === "find_match") {
+      try {
+        const { arenaId, bet } = data;
+
+        // Validate bet is integer >= 0
+        if (bet == null || typeof bet !== "number" || !Number.isInteger(bet) || bet < 0) {
+          return ws.send(JSON.stringify({ type: "error", message: "Invalid bet amount" }));
+        }
+
+        // Check not already in queue
+        if (userInQueue.has(ws.user.id)) {
+          return ws.send(JSON.stringify({ type: "error", message: "Already in queue" }));
+        }
+
+        // Check not already in a room
+        if (ws.roomId) {
+          return ws.send(JSON.stringify({ type: "error", message: "Already in a room" }));
+        }
+
+        // Validate arena
+        const arenaResult = await pool.query(
+          "SELECT * FROM arenas WHERE id = $1 AND is_active = true",
+          [arenaId]
+        );
+
+        if (arenaResult.rows.length === 0) {
+          return ws.send(JSON.stringify({ type: "error", message: "Arena not found" }));
+        }
+
+        const arena = arenaResult.rows[0];
+
+        // Validate bet range
+        if (bet < arena.min_bet || bet > arena.max_bet) {
+          return ws.send(JSON.stringify({
+            type: "error",
+            message: `Bet must be between ${arena.min_bet} and ${arena.max_bet}`
+          }));
+        }
+
+        // Check balance and deduct atomically
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+
+          const userResult = await client.query(
+            "SELECT balance FROM users WHERE id = $1 FOR UPDATE",
+            [ws.user.id]
+          );
+
+          if (userResult.rows[0].balance < bet) {
+            await client.query("ROLLBACK");
+            return ws.send(JSON.stringify({ type: "error", message: "Not enough balance" }));
+          }
+
+          if (bet > 0) {
+            await client.query(
+              "UPDATE users SET balance = balance - $1 WHERE id = $2",
+              [bet, ws.user.id]
+            );
+          }
+
+          await client.query("COMMIT");
+        } catch (err) {
+          await client.query("ROLLBACK");
+          throw err;
+        } finally {
+          client.release();
+        }
+
+        // Add to queue
+        if (!matchmakingQueue.has(arenaId)) {
+          matchmakingQueue.set(arenaId, new Map());
+        }
+        const betMap = matchmakingQueue.get(arenaId);
+        if (!betMap.has(bet)) {
+          betMap.set(bet, []);
+        }
+
+        const playerEntry = {
+          ws,
+          userId: ws.user.id,
+          joinedAt: Date.now()
+        };
+
+        betMap.get(bet).push(playerEntry);
+        userInQueue.set(ws.user.id, { arenaId, bet });
+
+        // Check for match
+        const queueForBet = betMap.get(bet);
+        if (queueForBet.length >= 2) {
+          const player1 = queueForBet.shift();
+          const player2 = queueForBet.shift();
+
+          userInQueue.delete(player1.userId);
+          userInQueue.delete(player2.userId);
+
+          // Clean up empty entries
+          if (queueForBet.length === 0) betMap.delete(bet);
+          if (betMap.size === 0) matchmakingQueue.delete(arenaId);
+
+          // Clear search timers
+          if (player1.searchInterval) clearInterval(player1.searchInterval);
+          if (player2.searchInterval) clearInterval(player2.searchInterval);
+          if (player1.timeoutTimer) clearTimeout(player1.timeoutTimer);
+          if (player2.timeoutTimer) clearTimeout(player2.timeoutTimer);
+
+          await createMatchRoom(player1, player2, arenaId, bet);
+        } else {
+          // No match yet — send searching status
+          ws.send(JSON.stringify({
+            type: "match_searching",
+            payload: {
+              arenaId,
+              bet,
+              position: queueForBet.length
+            }
+          }));
+
+          // Periodic updates every 10 seconds
+          playerEntry.searchInterval = setInterval(() => {
+            if (ws.readyState !== 1) {
+              clearInterval(playerEntry.searchInterval);
+              return;
+            }
+            const timeElapsed = Math.round((Date.now() - playerEntry.joinedAt) / 1000);
+            ws.send(JSON.stringify({
+              type: "match_searching",
+              payload: { arenaId, bet, timeElapsed }
+            }));
+          }, 10000);
+
+          // 60 second timeout
+          playerEntry.timeoutTimer = setTimeout(async () => {
+            if (playerEntry.searchInterval) clearInterval(playerEntry.searchInterval);
+
+            const removed = removeFromQueue(ws.user.id);
+            if (!removed) return;
+
+            // Refund bet
+            if (bet > 0) {
+              try {
+                await pool.query(
+                  "UPDATE users SET balance = balance + $1 WHERE id = $2",
+                  [bet, ws.user.id]
+                );
+              } catch (err) {
+                console.error("Refund error on timeout:", err);
+              }
+            }
+
+            if (ws.readyState === 1) {
+              ws.send(JSON.stringify({
+                type: "match_timeout",
+                payload: { arenaId, bet, refunded: true }
+              }));
+            }
+          }, 60000);
+        }
+
+        broadcastArenaQueueUpdate();
+
+      } catch (err) {
+        console.error("find_match error:", err);
+        ws.send(JSON.stringify({ type: "error", message: "Matchmaking error" }));
+      }
+    }
+
+    // ===== Матчмейкинг: Отменить поиск =====
+    if (data.type === "cancel_match") {
+      const info = userInQueue.get(ws.user.id);
+
+      if (!info) {
+        return ws.send(JSON.stringify({ type: "error", message: "Not in queue" }));
+      }
+
+      // Find and clear timers
+      const betMap = matchmakingQueue.get(info.arenaId);
+      if (betMap) {
+        const players = betMap.get(info.bet);
+        if (players) {
+          const entry = players.find(p => p.userId === ws.user.id);
+          if (entry) {
+            if (entry.searchInterval) clearInterval(entry.searchInterval);
+            if (entry.timeoutTimer) clearTimeout(entry.timeoutTimer);
+          }
+        }
+      }
+
+      removeFromQueue(ws.user.id);
+
+      // Refund bet
+      if (info.bet > 0) {
+        try {
+          await pool.query(
+            "UPDATE users SET balance = balance + $1 WHERE id = $2",
+            [info.bet, ws.user.id]
+          );
+        } catch (err) {
+          console.error("Refund error on cancel:", err);
+        }
+      }
+
+      ws.send(JSON.stringify({
+        type: "match_cancelled",
+        payload: { refunded: true }
+      }));
+    }
+
     if (data.type === "create_room") {
+  // Проверка: уже в очереди?
+  if (userInQueue.has(ws.user.id)) {
+    return ws.send(JSON.stringify({
+      type: "error",
+      message: "Cannot create room while searching for match"
+    }));
+  }
+
   // Проверка: уже в комнате?
   if (ws.roomId) {
     return ws.send(JSON.stringify({
@@ -1107,11 +1595,14 @@ if (data.type === "get_rooms_list") {
     }));
   }
 
-  // 🔥 определяем колонку
+  // определяем колонку
   const allowedColumns = {
     skin: "skin_id",
-    animation: "animation_id",
-    effect: "effect_id"
+    effect: "effect_id",
+    animation_hit: "animation_hit_id",
+    animation_miss: "animation_miss_id",
+    animation_win: "animation_win_id",
+    animation_lose: "animation_lose_id"
   };
 
   const column = allowedColumns[item.type];
@@ -1533,28 +2024,29 @@ if (data.type === "get_shop_items") {
 
   // получаем активную кастомизацию
   const customizationResult = await pool.query(`
-    SELECT skin_id, animation_id, effect_id
+    SELECT skin_id, effect_id, animation_hit_id, animation_miss_id, animation_win_id, animation_lose_id
     FROM user_customization
     WHERE user_id = $1
   `, [ws.user.id]);
 
   const active = customizationResult.rows[0] || {};
 
+  const typeToColumn = {
+    skin: "skin_id",
+    effect: "effect_id",
+    animation_hit: "animation_hit_id",
+    animation_miss: "animation_miss_id",
+    animation_win: "animation_win_id",
+    animation_lose: "animation_lose_id"
+  };
+
   const items = itemsResult.rows.map(item => {
 
     const isOwned =
       item.price === 0 || ownedIds.has(item.id);
 
-    let isActive = false;
-
-    if (item.type === "skin" && active.skin_id === item.id)
-      isActive = true;
-
-    if (item.type === "animation" && active.animation_id === item.id)
-      isActive = true;
-
-    if (item.type === "effect" && active.effect_id === item.id)
-      isActive = true;
+    const col = typeToColumn[item.type];
+    const isActive = col ? active[col] === item.id : false;
 
     return {
       id: item.id,
@@ -1841,6 +2333,38 @@ if (data.type === "make_move") {
 });
 
   ws.on("close", async () => {
+
+  // Handle disconnect from matchmaking queue
+  if (userInQueue.has(ws.user.id)) {
+    const info = userInQueue.get(ws.user.id);
+
+    // Clear timers
+    const betMap = matchmakingQueue.get(info.arenaId);
+    if (betMap) {
+      const players = betMap.get(info.bet);
+      if (players) {
+        const entry = players.find(p => p.userId === ws.user.id);
+        if (entry) {
+          if (entry.searchInterval) clearInterval(entry.searchInterval);
+          if (entry.timeoutTimer) clearTimeout(entry.timeoutTimer);
+        }
+      }
+    }
+
+    removeFromQueue(ws.user.id);
+
+    // Refund bet
+    if (info.bet > 0) {
+      try {
+        await pool.query(
+          "UPDATE users SET balance = balance + $1 WHERE id = $2",
+          [info.bet, ws.user.id]
+        );
+      } catch (err) {
+        console.error("Refund error on disconnect:", err);
+      }
+    }
+  }
 
   const roomId = ws.roomId;
   if (!roomId) return;

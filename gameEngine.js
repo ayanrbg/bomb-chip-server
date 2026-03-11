@@ -10,7 +10,7 @@ export class GameEngine {
     this.phase = "placing_bombs";
     this.disconnected = {}; // placing_bombs | playing | finished
 
-    // 🔥 ВСЕ ID ПРИВОДИМ К ЧИСЛАМ
+    // ВСЕ ID ПРИВОДИМ К ЧИСЛАМ
     hostId = Number(hostId);
     guestId = Number(guestId);
 
@@ -26,8 +26,81 @@ export class GameEngine {
     return {
       bombs: [],
       lives: 3,
-      revealed: new Set()
+      revealed: new Set(),
+      customization: null // will be set by server after loading from DB
     };
+  }
+
+  setCustomization(playerId, customization) {
+    playerId = Number(playerId);
+    if (this.players[playerId]) {
+      this.players[playerId].customization = customization;
+    }
+  }
+
+  getAnimations(attackerId, event, opponentId) {
+    attackerId = Number(attackerId);
+    const attacker = this.players[attackerId];
+    const attackerCustom = attacker?.customization || {};
+
+    const animations = [];
+
+    if (event === "hit") {
+      animations.push({
+        userId: attackerId,
+        role: "attacker",
+        event: "hit",
+        animation_code: attackerCustom.animation_hit_code || "default_anim",
+        effect_code: attackerCustom.effect_code || "default_effect"
+      });
+
+      if (opponentId != null) {
+        opponentId = Number(opponentId);
+        const defenderCustom = this.players[opponentId]?.customization || {};
+        animations.push({
+          userId: opponentId,
+          role: "defender",
+          event: "damaged",
+          animation_code: defenderCustom.animation_lose_code || "default_anim_lose",
+          effect_code: defenderCustom.effect_code || "default_effect"
+        });
+      }
+    } else if (event === "miss") {
+      animations.push({
+        userId: attackerId,
+        role: "attacker",
+        event: "miss",
+        animation_code: attackerCustom.animation_miss_code || "default_anim_miss",
+        effect_code: attackerCustom.effect_code || "default_effect"
+      });
+    }
+
+    return animations;
+  }
+
+  getFinishAnimations(winnerId, loserId) {
+    winnerId = Number(winnerId);
+    loserId = Number(loserId);
+
+    const winnerCustom = this.players[winnerId]?.customization || {};
+    const loserCustom = this.players[loserId]?.customization || {};
+
+    return [
+      {
+        userId: winnerId,
+        role: "winner",
+        event: "win",
+        animation_code: winnerCustom.animation_win_code || "default_anim_win",
+        effect_code: winnerCustom.effect_code || "default_effect"
+      },
+      {
+        userId: loserId,
+        role: "loser",
+        event: "lose",
+        animation_code: loserCustom.animation_lose_code || "default_anim_lose",
+        effect_code: loserCustom.effect_code || "default_effect"
+      }
+    ];
   }
 
   // =========================
@@ -90,7 +163,7 @@ export class GameEngine {
       return { error: "Not your turn" };
     }
 
-    // 🔥 Получаем ID соперника корректно
+    // Получаем ID соперника корректно
     const opponentId = Object.keys(this.players)
       .map(Number)
       .find(id => id !== playerId);
@@ -113,20 +186,24 @@ export class GameEngine {
       if (opponent.lives <= 0) {
         this.phase = "finished";
         return {
+          cell,
           bomb: true,
           explodedPlayer: opponentId,
           livesLeft: 0,
-          winner: playerId
+          winner: playerId,
+          animations: this.getAnimations(playerId, "hit", opponentId)
         };
       }
 
       this.turn = opponentId;
 
       return {
+        cell,
         bomb: true,
         explodedPlayer: opponentId,
         livesLeft: opponent.lives,
-        nextTurn: opponentId
+        nextTurn: opponentId,
+        animations: this.getAnimations(playerId, "hit", opponentId)
       };
     }
 
@@ -136,8 +213,10 @@ export class GameEngine {
     this.turn = opponentId;
 
     return {
+      cell,
       bomb: false,
-      nextTurn: opponentId
+      nextTurn: opponentId,
+      animations: this.getAnimations(playerId, "miss")
     };
   }
 }
