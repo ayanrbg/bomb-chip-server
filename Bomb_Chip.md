@@ -9,13 +9,15 @@
 1. [HTTP API (авторизация)](#1-http-api-авторизация)
 2. [WebSocket подключение](#2-websocket-подключение)
 3. [Автоматические сообщения при подключении](#3-автоматические-сообщения-при-подключении)
-4. [Комнаты](#4-комнаты)
-5. [Игровой процесс](#5-игровой-процесс)
-6. [Магазин и кастомизация](#6-магазин-и-кастомизация)
-7. [Друзья и инвайты](#7-друзья-и-инвайты)
-8. [Реконнект](#8-реконнект)
-9. [Ошибки](#9-ошибки)
-10. [Полный игровой цикл (пошагово)](#10-полный-игровой-цикл)
+4. [Арены (локации)](#4-арены-локации)
+5. [Матчмейкинг](#5-матчмейкинг)
+6. [Игровой процесс](#7-игровой-процесс)
+7. [Магазин и кастомизация](#8-магазин-и-кастомизация)
+8. [Друзья и инвайты](#9-друзья-и-инвайты)
+9. [Реконнект](#10-реконнект)
+10. [Ошибки](#11-ошибки)
+11. [Полный игровой цикл — Публичная игра](#12-полный-игровой-цикл--публичная-игра)
+12. [Полный игровой цикл — Игра с другом](#13-полный-игровой-цикл--игра-с-другом)
 
 ---
 
@@ -159,211 +161,364 @@ ws://<host>:3000?token=<JWT_TOKEN>
   "type": "user_customization",
   "payload": {
     "skin_id": 2,
-    "animation_id": 4,
-    "effect_id": 5,
     "skin_code": "default_skin2",
-    "animation_code": "default_anim",
-    "effect_code": "default_effect",
     "skin_index": "2",
-    "animation_index": "1",
-    "effect_index": "1"
+    "effect_id": 5,
+    "effect_code": "default_effect",
+    "effect_index": "1",
+    "animation_hit_id": 10,
+    "animation_hit_code": "fire_strike",
+    "animation_miss_id": 11,
+    "animation_miss_code": "smoke_puff",
+    "animation_win_id": 12,
+    "animation_win_code": "victory_dance",
+    "animation_lose_id": 13,
+    "animation_lose_code": "sad_explosion"
   }
 }
 ```
 
+> 6 слотов кастомизации: скин, эффект, и 4 анимации (hit, miss, win, lose).
+
 ---
 
-## 4. Комнаты
+## 4. Арены (локации)
 
-### 4.1 Получить список комнат
+### Концепция
+
+Арена — это игровая локация с визуальной темой и допустимым диапазоном ставок. Игрок выбирает арену → нажимает Play → попадает в комнату с выбранной ставкой.
+
+### Предустановленные арены
+
+| id | code | name | min_bet | max_bet | Описание |
+|----|------|------|---------|---------|----------|
+| 1 | `backyard` | Задний двор | 0 | 1000 | Стартовая арена для новичков |
+| 2 | `downtown` | Центр города | 1000 | 5000 | Средние ставки |
+| 3 | `rooftop` | Крыша | 5000 | 25000 | Высокие ставки |
+| 4 | `underground` | Подземелье | 25000 | 100000 | Хайроллеры |
+
+> Арены хранятся в БД — можно добавлять/менять без деплоя кода.
+
+### 4.1 Получить список арен
 
 **CLIENT →**
 ```json
-{ "type": "get_rooms_list" }
+{ "type": "get_arenas" }
 ```
 
-**SERVER → rooms_list**
+**SERVER → arenas_list**
 ```json
 {
-  "type": "rooms_list",
+  "type": "arenas_list",
   "payload": [
     {
       "id": 1,
-      "bet": 100,
-      "status": "waiting",
-      "host_id": 5,
-      "host_nickname": "Player1"
+      "code": "backyard",
+      "name": "Задний двор",
+      "min_bet": 0,
+      "max_bet": 1000,
+      "players_in_queue": 3
+    },
+    {
+      "id": 2,
+      "code": "downtown",
+      "name": "Центр города",
+      "min_bet": 1000,
+      "max_bet": 5000,
+      "players_in_queue": 1
     }
   ]
 }
 ```
 
-> Возвращает только открытые комнаты (status=waiting, без гостя).
+> `players_in_queue` — количество игроков, ожидающих матч на этой арене (для UI индикации активности).
+
+### 4.2 Реалтайм обновление очередей арен
+
+При каждом изменении очереди сервер рассылает **всем свободным клиентам** (не в комнате) обновлённые счётчики:
+
+**SERVER → arena_queue_update** (broadcast)
+```json
+{
+  "type": "arena_queue_update",
+  "payload": [
+    { "arenaId": 1, "players_in_queue": 5 },
+    { "arenaId": 2, "players_in_queue": 2 },
+    { "arenaId": 3, "players_in_queue": 0 },
+    { "arenaId": 4, "players_in_queue": 1 }
+  ]
+}
+```
+
+> Дебаунс: не чаще 1 раза в 2 секунды.
 
 ---
 
-### 4.2 Создать комнату
+## 5. Матчмейкинг
+
+### Концепция
+
+Игрок нажимает **«Play»** → выбирает арену и ставку → создаётся персональная комната. В течение **5 секунд** (окно приглашений) можно сделать комнату приватной и пригласить друга. Если окно истекло без приглашения — комната переходит в публичный поиск. Сервер подбирает оппонента с **точно совпадающей ставкой** на той же арене. Если за 5 секунд в очереди никого нет — подключается **бот**.
+
+**Ключевые принципы:**
+- Нет владельца комнаты — оба игрока равны
+- Игрок не может кикать другого, только выйти сам
+- Если кто-то покинул комнату до старта — countdown обнуляется, комната снова открыта для поиска
+- Бот играет как обычный игрок (ставит бомбы, делает ходы с задержками)
+
+### 5.1 Play — начать игру
 
 **CLIENT →**
 ```json
 {
-  "type": "create_room",
-  "bet": 100,
-  "password": "secret"
+  "type": "play",
+  "arenaId": 1,
+  "bet": 50
 }
 ```
 
 | Поле | Тип | Обязательно | Описание |
 |------|-----|-------------|----------|
-| `bet` | integer | да | Ставка (> 0, целое число) |
-| `password` | string | нет | Пароль для приватной комнаты |
+| `arenaId` | integer | да | ID арены |
+| `bet` | integer | да | Ставка (в диапазоне арены, >= 0) |
 
-**SERVER → room_created**
+**Логика:**
+1. Валидация арены, ставки, баланса
+2. Ставка списывается с баланса
+3. Создаётся комната
+4. Запускается 5-секундное окно приглашений
+
+**SERVER → room_created** (отправителю)
 ```json
 {
   "type": "room_created",
   "payload": {
-    "id": 1,
-    "host_id": 5,
-    "bet": 100,
-    "status": "waiting",
-    "host_ready": false,
-    "guest_ready": false,
-    "created_at": "2026-03-10T12:00:00.000Z"
+    "roomId": 42,
+    "arenaId": 1,
+    "bet": 50
   }
 }
 ```
 
-Далее автоматически приходит [room_info](#45-информация-о-комнате-broadcast) всем в комнате.
+**SERVER → invite_window_start** (отправителю)
+```json
+{
+  "type": "invite_window_start",
+  "payload": { "seconds": 5 }
+}
+```
 
-**Возможные ошибки:**
-- `"You are already in a room"` — уже в комнате
-- `"Invalid bet amount"` — ставка не целое положительное число
-- `"Not enough balance"` — недостаточно средств
+> Ставка списывается сразу при нажатии Play (резервирование). Возвращается при отмене.
+
+**Ошибки play:**
+| Сообщение | Причина |
+|-----------|---------|
+| `"Arena not found"` | Арена не существует |
+| `"Bet must be between X and Y"` | Ставка вне диапазона арены |
+| `"Invalid bet amount"` | Не целое неотрицательное число |
+| `"Not enough balance"` | Недостаточно средств |
+| `"Already in a room"` | Уже в комнате |
 
 ---
 
-### 4.3 Войти в комнату
+### 5.2 Окно приглашений (5 секунд)
+
+В течение 5 секунд после `invite_window_start` игрок может:
+
+#### Сделать комнату приватной
+
+**CLIENT →**
+```json
+{ "type": "make_private" }
+```
+
+**SERVER → room_updated** (отправителю)
+```json
+{
+  "type": "room_updated",
+  "payload": { "isPrivate": true }
+}
+```
+
+> Приватная комната НЕ попадает в публичный поиск. После окна она переходит в `private_waiting` и ждёт приглашённого друга.
+
+**Ошибки:**
+- `"Not in a room"` — не в комнате
+- `"Can only make private during invite window"` — окно уже закрылось
+
+#### Пригласить друга
 
 **CLIENT →**
 ```json
 {
-  "type": "join_room",
-  "roomId": 1,
-  "password": "secret"
-}
-```
-
-| Поле | Тип | Обязательно | Описание |
-|------|-----|-------------|----------|
-| `roomId` | integer | да | ID комнаты |
-| `password` | string | нет | Пароль (если комната приватная) |
-
-**SERVER → room_joined** (отправителю)
-```json
-{
-  "type": "room_joined",
-  "payload": { "roomId": 1 }
-}
-```
-
-**SERVER → play_request** (broadcast обоим игрокам)
-```json
-{ "type": "play_request" }
-```
-
-Далее автоматически приходит [room_info](#45-информация-о-комнате-broadcast) всем в комнате.
-
-**Возможные ошибки:**
-- `"You are already in a room"` — уже в комнате
-- `"Room not found"` — комната не найдена
-- `"Room requires password"` — нужен пароль
-- `"Wrong password"` — неверный пароль
-- `"You are already in this room"` — уже в этой комнате
-- `"Not enough balance"` — недостаточно средств
-- `"Room is full"` — комната занята
-
----
-
-### 4.4 Запросить информацию о комнате
-
-**CLIENT →**
-```json
-{ "type": "get_room_info" }
-```
-
-> Требует, чтобы клиент был в комнате (`ws.roomId` установлен).
-
-**SERVER → room_info** (только отправителю)
-```json
-{
-  "type": "room_info",
-  "payload": {
-    "id": 1,
-    "status": "waiting",
-    "bet": 100,
-    "host": {
-      "id": 5,
-      "nickname": "Player1",
-      "ready": false
-    },
-    "guest": {
-      "id": 8,
-      "nickname": "Player2",
-      "ready": true
-    }
-  }
-}
-```
-
-> `guest` будет `null`, если в комнате один игрок.
-
----
-
-### 4.5 Информация о комнате (broadcast)
-
-Сервер автоматически рассылает `room_info` всем игрокам в комнате при любом изменении состояния (вход, выход, ready, кик и т.д.).
-
-**SERVER → room_info**
-```json
-{
-  "type": "room_info",
-  "payload": {
-    "id": 1,
-    "status": "waiting",
-    "bet": 100,
-    "isPrivate": true,
-    "host": {
-      "id": 5,
-      "nickname": "Player1",
-      "ready": false
-    },
-    "guest": null
-  }
-}
-```
-
----
-
-### 4.6 Готовность (ready)
-
-**CLIENT →**
-```json
-{
-  "type": "player_ready",
-  "ready": true
+  "type": "invite_friend",
+  "friendId": 8
 }
 ```
 
 | Поле | Тип | Описание |
 |------|-----|----------|
-| `ready` | boolean | `true` — готов, `false` — не готов |
+| `friendId` | integer | ID друга из списка друзей |
 
-**Результат:** обновлённый `room_info` broadcast. Если оба готовы — запускается [обратный отсчёт](#51-обратный-отсчёт).
+**SERVER → invite_sent** (отправителю)
+```json
+{ "type": "invite_sent" }
+```
+
+**SERVER → game_invite_received** (приглашённому, если онлайн)
+```json
+{
+  "type": "game_invite_received",
+  "payload": {
+    "roomId": 42,
+    "from": "Player1",
+    "fromId": 5,
+    "bet": 50,
+    "arenaId": 1
+  }
+}
+```
+
+**Ошибки:**
+- `"Not in a room"` — не в комнате
+- `"Cannot invite now"` — окно закрылось или комната уже в другом статусе
+- `"Invalid friend"` — невалидный ID
+- `"Not your friend"` — не в списке друзей
+
+#### Друг принимает инвайт
+
+**CLIENT →** (от приглашённого)
+```json
+{
+  "type": "accept_invite",
+  "roomId": 42
+}
+```
+
+**Логика:**
+1. Ставка списывается с баланса приглашённого
+2. Приглашённый добавляется в комнату
+3. Окно приглашений отменяется
+4. Начинается countdown к старту
+
+**SERVER → opponent_joined** (обоим игрокам, далее см. [5.5](#55-оппонент-найден))
+
+**Ошибки:**
+- `"Already in a room"` — уже в комнате
+- `"Room not available"` — комната недоступна
+- `"No invite for this room"` — нет инвайта
+- `"Not enough balance"` — недостаточно средств
 
 ---
 
-### 4.7 Выйти из комнаты
+### 5.3 Окно закрылось
+
+Через 5 секунд после `invite_window_start` сервер отправляет:
+
+**SERVER → invite_window_end** (отправителю)
+
+Публичная комната:
+```json
+{
+  "type": "invite_window_end",
+  "payload": { "status": "searching" }
+}
+```
+
+Приватная комната:
+```json
+{
+  "type": "invite_window_end",
+  "payload": { "status": "private_waiting" }
+}
+```
+
+Для публичной комнаты сразу после `invite_window_end` приходит:
+
+**SERVER → searching_opponent** (отправителю)
+```json
+{ "type": "searching_opponent" }
+```
+
+> После этого сервер ищет оппонента с той же ставкой на той же арене. Если за 5 секунд оппонент не найден — подключается бот.
+
+---
+
+### 5.4 Отменить поиск / выйти до игры
+
+**CLIENT →**
+```json
+{ "type": "cancel_play" }
+```
+
+**SERVER → play_cancelled**
+```json
+{
+  "type": "play_cancelled",
+  "payload": { "refunded": true }
+}
+```
+
+> Ставка возвращается. Работает на любом этапе до начала игры (invite_window, searching, private_waiting, countdown).
+
+**Ошибки:**
+- `"Not in a room"` — не в комнате
+- `"No room state"` — нет состояния комнаты
+- `"Game already started"` — игра уже идёт (используйте `leave_room`)
+
+---
+
+### 5.5 Оппонент найден
+
+Когда оппонент (реальный или бот) подключается к комнате, оба игрока получают:
+
+**SERVER → opponent_joined** (обоим)
+```json
+{
+  "type": "opponent_joined",
+  "payload": {
+    "roomId": 42,
+    "arenaId": 1,
+    "arenaCode": "backyard",
+    "bet": 50,
+    "opponent": {
+      "id": 8,
+      "nickname": "Player2",
+      "skin_code": "gold_skin",
+      "effect_code": "default_effect"
+    }
+  }
+}
+```
+
+> В `opponent_joined` сразу передаётся кастомизация оппонента, чтобы клиент мог загрузить ассеты до начала игры.
+
+> Если оппонент — бот, его `id` будет отрицательным числом. Бот имеет рандомный никнейм, скин и эффект.
+
+Сразу после `opponent_joined` начинается [обратный отсчёт](#61-обратный-отсчёт).
+
+---
+
+### 5.6 Боты
+
+Если через 5 секунд после начала публичного поиска оппонент не найден — подключается бот.
+
+**Поведение бота:**
+- Рандомный никнейм из пула (напр. `"CoolBot742"`, `"NeonWolf158"`)
+- Рандомный скин из дефолтных
+- Дефолтные эффекты и анимации
+- Размещает бомбы с задержкой 2-4 секунды
+- Делает ходы с задержкой 1-3 секунды на рандомную доступную клетку
+- Играет по тем же правилам, что и обычный игрок
+
+**Экономика бота:**
+- Победа игрока над ботом: игрок получает `bet × 2` (дом оплачивает долю бота)
+- Поражение игрока от бота: игрок теряет свою ставку (уже списана при нажатии Play)
+- При дисконнекте во время игры с ботом — мгновенный проигрыш (без 30-секундного grace period)
+
+---
+
+### 5.7 Выйти из комнаты
 
 **CLIENT →**
 ```json
@@ -375,54 +530,91 @@ ws://<host>:3000?token=<JWT_TOKEN>
 { "type": "left_room" }
 ```
 
-**Логика:**
-- **Комната в ожидании (waiting):** ставка возвращается. Если хост уходит и есть гость — гость становится хостом.
-- **Игра идёт (playing):** противник автоматически побеждает и получает `bet × 2`. Противнику приходит `game_finished` с `reason: "opponent_left"`.
+**Логика по статусам:**
+
+| Статус | Поведение |
+|--------|-----------|
+| **invite_window / searching / private_waiting** | Ставка возвращается. Комната удаляется. |
+| **matched (countdown)** | Ставка уходящему возвращается. Countdown отменяется. Оставшийся игрок получает `countdown_cancelled` и переходит обратно в поиск. Если оппонент был бот — комната удаляется. |
+| **playing** | Противник автоматически побеждает и получает `bet × 2`. Противнику приходит `game_finished` с `reason: "opponent_left"`. Против бота — игрок проигрывает. |
 
 **Ошибки:**
 - `"You are not in a room"`
 
 ---
 
-### 4.8 Кикнуть игрока
-
-Только хост может кикнуть гостя. Только до начала игры.
+### 5.8 Информация о комнате
 
 **CLIENT →**
 ```json
+{ "type": "get_room_info" }
+```
+
+> Требует, чтобы клиент был в комнате.
+
+**SERVER → room_info**
+```json
 {
-  "type": "kick_player",
-  "playerId": 8
+  "type": "room_info",
+  "payload": {
+    "id": 42,
+    "status": "searching",
+    "bet": 50,
+    "arenaId": 1,
+    "player1": {
+      "id": 5,
+      "nickname": "Player1"
+    },
+    "player2": null
+  }
 }
 ```
 
-**SERVER → kicked_from_room** (кикнутому игроку)
+С ботом:
 ```json
-{ "type": "kicked_from_room" }
+{
+  "type": "room_info",
+  "payload": {
+    "id": 42,
+    "status": "matched",
+    "bet": 50,
+    "arenaId": 1,
+    "player1": {
+      "id": 5,
+      "nickname": "Player1"
+    },
+    "player2": {
+      "id": -1,
+      "nickname": "NeonWolf158",
+      "isBot": true
+    }
+  }
+}
 ```
 
-Кикнутому возвращается ставка. Всем в комнате приходит обновлённый `room_info`.
+> `status` — одно из: `"invite_window"`, `"private_waiting"`, `"searching"`, `"matched"`, `"playing"`
+> `player2` — `null` если в комнате один игрок. Поле `isBot: true` если оппонент — бот.
+> Нет понятия «хост» — оба игрока равны.
 
 **Ошибки:**
-- `"Only host can kick"`
-- `"Invalid target"`
-- `"Cannot kick during game"`
+- `"You are not in a room"`
 
 ---
 
-## 5. Игровой процесс
+## 6. Игровой процесс
 
 ### Общая схема
 
 ```
-player_ready (оба) → game_countdown → game_started → request_bombs
-→ place_bombs (оба) → bombs_phase_finished → request_move / opponent_move
-→ make_move → move_result → ... → game_finished
+play → room_created → invite_window_start → (5 сек) → invite_window_end
+→ searching_opponent → opponent_joined → game_countdown → game_started
+→ request_bombs → place_bombs (оба) → bombs_phase_finished
+→ request_move / opponent_move → make_move → move_result → ... → game_finished
 ```
 
-### 5.1 Обратный отсчёт
+### 6.1 Обратный отсчёт
 
-Когда оба игрока нажали ready, начинается 5-секундный countdown.
+Начинается автоматически когда оба игрока в комнате (`opponent_joined`). 5 секунд.
 
 **SERVER → game_countdown** (broadcast, каждую секунду)
 ```json
@@ -434,23 +626,30 @@ player_ready (оба) → game_countdown → game_started → request_bombs
 
 > `timeLeft` уменьшается: 5, 4, 3, 2, 1, 0. При 0 — запускается игра.
 
-**SERVER → countdown_cancelled** (если кто-то снял ready или вышел)
+**SERVER → countdown_cancelled** (если кто-то покинул комнату до старта)
 ```json
-{ "type": "countdown_cancelled" }
+{
+  "type": "countdown_cancelled",
+  "payload": { "reason": "opponent_left" }
+}
 ```
+
+После `countdown_cancelled` оставшийся игрок переходит обратно в поиск и получает `searching_opponent`.
 
 ---
 
-### 5.2 Старт игры
+### 6.2 Старт игры
 
 **SERVER → game_started** (broadcast)
 ```json
 { "type": "game_started" }
 ```
 
+> Первый ход выбирается **случайно** — нет преимущества у какого-либо игрока.
+
 ---
 
-### 5.3 Фаза установки бомб (20 секунд)
+### 6.3 Фаза установки бомб (20 секунд)
 
 Сразу после `game_started` приходит:
 
@@ -503,13 +702,13 @@ player_ready (оба) → game_countdown → game_started → request_bombs
 { "type": "bombs_phase_finished" }
 ```
 
-> Если игрок не расставил все 3 бомбы за 20 секунд — недостающие расставляются случайно.
+> Если игрок (или бот) не расставил все 3 бомбы за 20 секунд — недостающие расставляются случайно.
 
 ---
 
-### 5.4 Фаза ходов (по 15 секунд на ход)
+### 6.4 Фаза ходов (по 15 секунд на ход)
 
-После `bombs_phase_finished` начинается пошаговая фаза. Первым ходит хост.
+После `bombs_phase_finished` начинается пошаговая фаза. Первый ход выбран случайно при старте.
 
 **SERVER → request_move** (игроку, чей ход)
 ```json
@@ -556,7 +755,7 @@ player_ready (оба) → game_countdown → game_started → request_bombs
 
 ---
 
-### 5.5 Сделать ход
+### 6.5 Сделать ход
 
 **CLIENT → make_move**
 ```json
@@ -572,42 +771,105 @@ player_ready (оба) → game_countdown → game_started → request_bombs
 
 **SERVER → move_result** (broadcast)
 
-Промах:
+Попадание (bomb: true):
 ```json
 {
   "type": "move_result",
   "payload": {
-    "bomb": false,
-    "nextTurn": 8
+    "cell": 3,
+    "bomb": true,
+    "explodedPlayer": 8,
+    "livesLeft": 2,
+    "nextTurn": 8,
+    "animations": [
+      {
+        "userId": 5,
+        "role": "attacker",
+        "event": "hit",
+        "animation_code": "fire_strike",
+        "effect_code": "explosion_red"
+      },
+      {
+        "userId": 8,
+        "role": "defender",
+        "event": "damaged",
+        "animation_code": "default_anim_lose",
+        "effect_code": "default_effect"
+      }
+    ]
   }
 }
 ```
 
-Попадание:
+Промах (bomb: false):
 ```json
 {
   "type": "move_result",
   "payload": {
-    "bomb": true,
-    "explodedPlayer": 8,
-    "livesLeft": 2,
-    "nextTurn": 8
+    "cell": 7,
+    "bomb": false,
+    "nextTurn": 8,
+    "animations": [
+      {
+        "userId": 5,
+        "role": "attacker",
+        "event": "miss",
+        "animation_code": "smoke_puff",
+        "effect_code": "explosion_red"
+      }
+    ]
   }
 }
 ```
+
+> При промахе — только анимация атакующего. Защитник не затронут.
 
 Победа (у противника 0 жизней):
 ```json
 {
   "type": "move_result",
   "payload": {
+    "cell": 9,
     "bomb": true,
     "explodedPlayer": 8,
     "livesLeft": 0,
-    "winner": 5
+    "winner": 5,
+    "animations": [
+      {
+        "userId": 5,
+        "role": "attacker",
+        "event": "hit",
+        "animation_code": "fire_strike",
+        "effect_code": "explosion_red"
+      },
+      {
+        "userId": 8,
+        "role": "defender",
+        "event": "damaged",
+        "animation_code": "default_anim_lose",
+        "effect_code": "default_effect"
+      }
+    ]
   }
 }
 ```
+
+**Поля `animations`:**
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| `userId` | integer | ID игрока |
+| `role` | string | `"attacker"`, `"defender"`, `"winner"`, `"loser"` |
+| `event` | string | `"hit"`, `"miss"`, `"damaged"`, `"win"`, `"lose"` |
+| `animation_code` | string | Код экипированной анимации игрока |
+| `effect_code` | string | Код экипированного эффекта игрока |
+
+**Откуда берутся коды анимаций:**
+- **hit** → `animation_hit_code` атакующего
+- **miss** → `animation_miss_code` атакующего
+- **damaged** → `animation_lose_code` защитника (анимация получения урона)
+- **win** → `animation_win_code` победителя
+- **lose** → `animation_lose_code` проигравшего
 
 **Ошибки:**
 - `"Invalid cell"` — невалидная клетка
@@ -619,7 +881,7 @@ player_ready (оба) → game_countdown → game_started → request_bombs
 
 ---
 
-### 5.6 Конец игры
+### 6.6 Конец игры
 
 **SERVER → game_finished** (broadcast)
 
@@ -629,7 +891,26 @@ player_ready (оба) → game_countdown → game_started → request_bombs
   "type": "game_finished",
   "payload": {
     "winnerId": 5,
-    "prize": 200
+    "loserId": 8,
+    "prize": 100,
+    "arenaId": 1,
+    "arenaCode": "backyard",
+    "animations": [
+      {
+        "userId": 5,
+        "role": "winner",
+        "event": "win",
+        "animation_code": "victory_dance",
+        "effect_code": "explosion_red"
+      },
+      {
+        "userId": 8,
+        "role": "loser",
+        "event": "lose",
+        "animation_code": "sad_explosion",
+        "effect_code": "default_effect"
+      }
+    ]
   }
 }
 ```
@@ -649,9 +930,9 @@ player_ready (оба) → game_countdown → game_started → request_bombs
 
 ---
 
-## 6. Магазин и кастомизация
+## 7. Магазин и кастомизация
 
-### 6.1 Получить список предметов
+### 7.1 Получить список предметов
 
 **CLIENT →**
 ```json
@@ -674,10 +955,10 @@ player_ready (оба) → game_countdown → game_started → request_bombs
       "active": true
     },
     {
-      "id": 6,
-      "code": "gold_skin",
-      "name": "Gold Skin",
-      "type": "skin",
+      "id": 10,
+      "code": "fire_strike",
+      "name": "Fire Strike",
+      "type": "animation_hit",
       "price": 500,
       "currency": "coins",
       "owned": false,
@@ -687,15 +968,37 @@ player_ready (оба) → game_countdown → game_started → request_bombs
 }
 ```
 
+### Типы предметов
+
+| type | Описание |
+|------|----------|
+| `skin` | Скин персонажа |
+| `effect` | Визуальный эффект |
+| `animation_hit` | Анимация попадания |
+| `animation_miss` | Анимация промаха |
+| `animation_win` | Анимация победы |
+| `animation_lose` | Анимация поражения |
+
 | Поле | Тип | Описание |
 |------|-----|----------|
-| `type` | string | `"skin"`, `"animation"` или `"effect"` |
+| `type` | string | Один из 6 типов выше |
 | `owned` | boolean | `true` если куплен или бесплатный |
 | `active` | boolean | `true` если экипирован |
 
+### Типы анимаций (по событиям)
+
+Каждый тип анимации — это **отдельный предмет** в магазине, который игрок экипирует независимо.
+
+| Тип в shop_items | Событие | Когда проигрывается | Кто видит |
+|------------------|---------|---------------------|-----------|
+| `animation_hit` | Попадание в бомбу | Атакующий попал в бомбу оппонента | Оба |
+| `animation_miss` | Промах | Атакующий промахнулся | Оба |
+| `animation_win` | Победа | Игра окончена, проигрывается победителю | Оба |
+| `animation_lose` | Поражение | Игра окончена, проигрывается проигравшему | Оба |
+
 ---
 
-### 6.2 Купить предмет
+### 7.2 Купить предмет
 
 **CLIENT →**
 ```json
@@ -721,7 +1024,7 @@ player_ready (оба) → game_countdown → game_started → request_bombs
 
 ---
 
-### 6.3 Экипировать предмет
+### 7.3 Экипировать предмет
 
 **CLIENT →**
 ```json
@@ -740,6 +1043,7 @@ player_ready (оба) → game_countdown → game_started → request_bombs
 ```
 
 > Бесплатные предметы можно экипировать без покупки. Платные — только после покупки.
+> Предмет экипируется в слот, соответствующий его типу (`skin` → слот скина, `animation_hit` → слот анимации попадания и т.д.).
 
 **Ошибки:**
 - `"Item not found"` — предмет не существует
@@ -748,9 +1052,9 @@ player_ready (оба) → game_countdown → game_started → request_bombs
 
 ---
 
-## 7. Друзья и инвайты
+## 8. Друзья и инвайты
 
-### 7.1 Список друзей
+### 8.1 Список друзей
 
 **CLIENT →**
 ```json
@@ -770,7 +1074,7 @@ player_ready (оба) → game_countdown → game_started → request_bombs
 
 ---
 
-### 7.2 Отправить заявку в друзья
+### 8.2 Отправить заявку в друзья
 
 **CLIENT →**
 ```json
@@ -806,7 +1110,7 @@ player_ready (оба) → game_countdown → game_started → request_bombs
 
 ---
 
-### 7.3 Принять заявку в друзья
+### 8.3 Принять заявку в друзья
 
 **CLIENT →**
 ```json
@@ -832,34 +1136,7 @@ player_ready (оба) → game_countdown → game_started → request_bombs
 
 ---
 
-### 7.4 Пригласить друга в комнату
-
-Отправитель должен быть в комнате.
-
-**CLIENT →**
-```json
-{
-  "type": "invite_to_room",
-  "friendId": 8
-}
-```
-
-**SERVER → game_invite_received** (приглашённому, если онлайн)
-```json
-{
-  "type": "game_invite_received",
-  "payload": {
-    "roomId": 1,
-    "from": "Player1"
-  }
-}
-```
-
-> Приглашённый может войти в комнату через обычный `join_room` с полученным `roomId`.
-
----
-
-## 8. Реконнект
+## 9. Реконнект
 
 При повторном подключении клиент может восстановить состояние:
 
@@ -882,10 +1159,13 @@ player_ready (оба) → game_countdown → game_started → request_bombs
   "type": "reconnect_ok",
   "payload": {
     "inRoom": true,
-    "roomId": 1
+    "roomId": 42,
+    "status": "playing"
   }
 }
 ```
+
+> `status` — текущий статус комнаты: `"invite_window"`, `"private_waiting"`, `"searching"`, `"matched"`, `"playing"`.
 
 Если игра активна, дополнительно приходит:
 
@@ -909,15 +1189,13 @@ player_ready (оба) → game_countdown → game_started → request_bombs
 | `bombsTimeLeft` | integer | Оставшееся время фазы бомб |
 | `moveTimeLeft` | integer | Оставшееся время на ход |
 
-После `game_state_restore` также приходит `request_move` или `opponent_move` с актуальным состоянием.
+После `game_state_restore` также приходит `request_move` или `opponent_move` с актуальным состоянием и `room_info`.
 
-Далее также приходит `room_info` с текущим состоянием комнаты.
-
-> **Тайм-аут дисконнекта:** 30 секунд. Если игрок не реконнектится за 30 секунд во время активной игры — противник автоматически побеждает.
+> **Тайм-аут дисконнекта:** 30 секунд для реальных оппонентов. При игре с ботом — мгновенный проигрыш при дисконнекте.
 
 ---
 
-## 9. Ошибки
+## 10. Ошибки
 
 Все ошибки приходят в формате:
 ```json
@@ -955,7 +1233,7 @@ player_ready (оба) → game_countdown → game_started → request_bombs
 
 ---
 
-## 10. Полный игровой цикл
+## 11. Полный игровой цикл — Публичная игра
 
 Пошаговая последовательность сообщений для одной полной партии:
 
@@ -968,41 +1246,45 @@ ws://host:3000?token=...    ─────────────────�
                             <── authSuccess
                             <── user_customization
 
-2. СОЗДАНИЕ КОМНАТЫ
-{type:"create_room",        ──────────────────────>
- bet:100}
-                            <── room_created
-                            <── room_info
+2. ВЫБОР АРЕНЫ
+{type:"get_arenas"}         ──────────────────────>
+                            <── arenas_list
 
-3. ВХОД В КОМНАТУ
-                                                        {type:"join_room",
-                            <───────────────────────     roomId:1}
-                            ──> room_joined (B)
-                            ──> play_request (A+B)
-                            ──> room_info (A+B)
+3. НАЖАТИЕ PLAY
+{type:"play",               ──────────────────────>
+ arenaId:1, bet:50}
+                            <── room_created {roomId:42}
+                            <── invite_window_start {seconds:5}
 
-4. ГОТОВНОСТЬ
-{type:"player_ready",       ──────────────────────>
- ready:true}
-                            ──> room_info (A+B)
+4. ОКНО ПРИГЛАШЕНИЙ (5 сек) — игрок может пригласить друга или ничего не делать
 
-                                                        {type:"player_ready",
-                            <───────────────────────     ready:true}
-                            ──> room_info (A+B)
+5. ОКНО ЗАКРЫЛОСЬ
+                            <── invite_window_end {status:"searching"}
+                            <── searching_opponent
 
-5. ОБРАТНЫЙ ОТСЧЁТ (5 сек)
+6. ПОИСК ОППОНЕНТА
+                                                        {type:"play",
+                            <───────────────────────     arenaId:1, bet:50}
+                                                        <── room_created
+                                                        <── invite_window_start
+                                                        ... (5 сек) ...
+                                                        <── invite_window_end
+                                                        <── searching_opponent
+
+7. МАТЧ НАЙДЕН (один игрок перемещается в комнату другого)
+                            ──> opponent_joined (A) {opponent: B info}
+                            ──> opponent_joined (B) {opponent: A info}
+
+8. ОБРАТНЫЙ ОТСЧЁТ (5 сек, автоматически)
                             ──> game_countdown {timeLeft:5} (A+B)
-                            ──> game_countdown {timeLeft:4} (A+B)
-                            ──> game_countdown {timeLeft:3} (A+B)
-                            ──> game_countdown {timeLeft:2} (A+B)
-                            ──> game_countdown {timeLeft:1} (A+B)
+                            ...
                             ──> game_countdown {timeLeft:0} (A+B)
 
-6. СТАРТ
+9. СТАРТ
                             ──> game_started (A+B)
                             ──> request_bombs (A+B)
 
-7. ФАЗА БОМБ (20 сек)
+10. ФАЗА БОМБ (20 сек)
                             ──> bombs_phase_update {timeLeft:18} (A+B)
 
 {type:"place_bombs",        ──────────────────────>
@@ -1016,32 +1298,165 @@ ws://host:3000?token=...    ─────────────────�
                             ──> bombs_placed (A+B)
                             ──> bombs_phase_finished (A+B)
 
-8. ФАЗА ХОДОВ
-                            ──> request_move (A, хост ходит первым)
+11. ФАЗА ХОДОВ (первый ход — случайный)
+                            ──> request_move (A)
                             ──> opponent_move (B)
                             ──> move_timer_update {timeLeft:13} (A+B)
 
 {type:"make_move",          ──────────────────────>
  cell:3}
-                            ──> move_result {bomb:true, explodedPlayer:8,
-                                            livesLeft:2, nextTurn:8} (A+B)
+                            ──> move_result {
+                                  cell:3, bomb:true,
+                                  explodedPlayer:8, livesLeft:2,
+                                  nextTurn:8,
+                                  animations: [...]
+                                } (A+B)
 
                             ──> request_move (B)
                             ──> opponent_move (A)
 
                                                         {type:"make_move",
                             <───────────────────────     cell:0}
-                            ──> move_result {bomb:true, explodedPlayer:5,
-                                            livesLeft:2, nextTurn:5} (A+B)
+                            ──> move_result {
+                                  cell:0, bomb:false,
+                                  nextTurn:5,
+                                  animations: [...]
+                                } (A+B)
 
 ... (ходы продолжаются) ...
 
-9. КОНЕЦ ИГРЫ
+12. КОНЕЦ ИГРЫ
 {type:"make_move",          ──────────────────────>
  cell:9}
-                            ──> move_result {bomb:true, explodedPlayer:8,
-                                            livesLeft:0, winner:5} (A+B)
-                            ──> game_finished {winnerId:5, prize:200} (A+B)
+                            ──> move_result {
+                                  cell:9, bomb:true,
+                                  explodedPlayer:8, livesLeft:0,
+                                  winner:5,
+                                  animations: [...]
+                                } (A+B)
+                            ──> game_finished {
+                                  winnerId:5, loserId:8, prize:100,
+                                  arenaId:1, arenaCode:"backyard",
+                                  animations: [...]
+                                } (A+B)
+```
+
+---
+
+## 12. Полный игровой цикл — Игра с другом
+
+Пошаговая последовательность для приватной игры с приглашением друга:
+
+```
+КЛИЕНТ A                    СЕРВЕР                      КЛИЕНТ B
+─────────                   ──────                      ─────────
+
+1. ПОДКЛЮЧЕНИЕ
+ws://host:3000?token=...    ──────────────────────>
+                            <── authSuccess
+                            <── user_customization
+
+2. НАЖАТИЕ PLAY
+{type:"play",               ──────────────────────>
+ arenaId:1, bet:100}
+                            <── room_created {roomId:42}
+                            <── invite_window_start {seconds:5}
+
+3. ДЕЛАЕМ КОМНАТУ ПРИВАТНОЙ
+{type:"make_private"}       ──────────────────────>
+                            <── room_updated {isPrivate:true}
+
+4. ПРИГЛАШАЕМ ДРУГА
+{type:"invite_friend",      ──────────────────────>
+ friendId:8}
+                            <── invite_sent
+                            ──> game_invite_received (B) {roomId:42, bet:100}
+
+5. ДРУГ ПРИНИМАЕТ ИНВАЙТ
+                                                        {type:"accept_invite",
+                            <───────────────────────     roomId:42}
+                            ──> opponent_joined (A) {opponent: B info}
+                            ──> opponent_joined (B) {opponent: A info}
+
+6. ОБРАТНЫЙ ОТСЧЁТ (5 сек)
+                            ──> game_countdown {timeLeft:5} (A+B)
+                            ...
+                            ──> game_countdown {timeLeft:0} (A+B)
+
+7. СТАРТ + БОМБЫ + ХОДЫ — аналогично публичной игре (раздел 11)
+
+8. КОНЕЦ ИГРЫ
+                            ──> game_finished {
+                                  winnerId:5, loserId:8, prize:200,
+                                  arenaId:1, arenaCode:"backyard",
+                                  animations: [...]
+                                } (A+B)
+```
+
+---
+
+## 13. Полный игровой цикл — Игра с ботом
+
+Если оппонент не найден — подключается бот через 5 секунд:
+
+```
+КЛИЕНТ A                    СЕРВЕР
+─────────                   ──────
+
+1. НАЖАТИЕ PLAY
+{type:"play",               ──────────────────────>
+ arenaId:1, bet:50}
+                            <── room_created {roomId:42}
+                            <── invite_window_start {seconds:5}
+
+2. ОКНО ЗАКРЫЛОСЬ
+                            <── invite_window_end {status:"searching"}
+                            <── searching_opponent
+
+3. 5 СЕКУНД ПОИСКА — НИКОГО НЕТ → БОТ
+
+                            <── opponent_joined {
+                                  opponent: {
+                                    id: -1,
+                                    nickname: "NeonWolf158",
+                                    skin_code: "default_skin2",
+                                    effect_code: "default_effect"
+                                  }
+                                }
+
+4. ОБРАТНЫЙ ОТСЧЁТ
+                            <── game_countdown {timeLeft:5}
+                            ...
+                            <── game_countdown {timeLeft:0}
+
+5. СТАРТ
+                            <── game_started
+                            <── request_bombs
+
+6. БОМБЫ — бот расставляет с задержкой 2-4 сек
+{type:"place_bombs",        ──────────────────────>
+ bombs:[0,5,11]}
+                            ... (бот ставит бомбы) ...
+                            <── bombs_placed
+                            <── bombs_phase_finished
+
+7. ХОДЫ — бот ходит с задержкой 1-3 сек
+                            <── request_move (A)
+{type:"make_move",          ──────────────────────>
+ cell:3}
+                            <── move_result {...}
+
+                            ... (бот делает ход с задержкой) ...
+                            <── move_result {...} (ход бота)
+
+... (ходы продолжаются) ...
+
+8. КОНЕЦ ИГРЫ
+                            <── game_finished {
+                                  winnerId:5, loserId:-1, prize:100,
+                                  arenaId:1, arenaCode:"backyard",
+                                  animations: [...]
+                                }
 ```
 
 ---
@@ -1053,13 +1468,14 @@ ws://host:3000?token=...    ─────────────────�
 | type | Параметры | Описание |
 |------|-----------|----------|
 | `get_user_stats` | — | Запрос профиля |
-| `get_rooms_list` | — | Список открытых комнат |
-| `create_room` | `bet`, `password?` | Создать комнату |
-| `join_room` | `roomId`, `password?` | Войти в комнату |
-| `get_room_info` | — | Запросить инфо о текущей комнате |
+| `get_arenas` | — | Список арен |
+| `play` | `arenaId`, `bet` | Начать игру (создать комнату + окно приглашений) |
+| `make_private` | — | Сделать комнату приватной (во время invite window) |
+| `invite_friend` | `friendId` | Пригласить друга в комнату |
+| `accept_invite` | `roomId` | Принять инвайт в комнату |
+| `cancel_play` | — | Отменить поиск / выйти до игры |
 | `leave_room` | — | Выйти из комнаты |
-| `kick_player` | `playerId` | Кикнуть гостя (только хост) |
-| `player_ready` | `ready` | Установить готовность |
+| `get_room_info` | — | Запросить инфо о текущей комнате |
 | `place_bombs` | `bombs` (int[3]) | Расставить 3 бомбы |
 | `make_move` | `cell` (int 0-11) | Сделать ход |
 | `get_shop_items` | — | Список предметов магазина |
@@ -1068,7 +1484,6 @@ ws://host:3000?token=...    ─────────────────�
 | `get_friends` | — | Список друзей |
 | `send_friend_request` | `userId` | Отправить заявку в друзья |
 | `accept_friend_request` | `requestId` | Принять заявку |
-| `invite_to_room` | `friendId` | Пригласить друга в комнату |
 | `reconnect` | — | Восстановить состояние |
 
 ### Сервер → Клиент
@@ -1076,17 +1491,21 @@ ws://host:3000?token=...    ─────────────────�
 | type | Кому | Когда |
 |------|------|-------|
 | `authSuccess` | отправителю | при подключении |
-| `user_customization` | отправителю | при подключении |
+| `user_customization` | отправителю | при подключении (6 слотов) |
 | `user_stats` | отправителю | по запросу |
-| `rooms_list` | отправителю | по запросу |
-| `room_created` | отправителю | комната создана |
-| `room_joined` | отправителю | вошёл в комнату |
-| `room_info` | broadcast (комната) | при изменении состояния комнаты |
-| `play_request` | broadcast (комната) | оба игрока в комнате |
-| `kicked_from_room` | кикнутому | кик из комнаты |
-| `left_room` | отправителю | вышел из комнаты |
+| `arenas_list` | отправителю | по запросу |
+| `arena_queue_update` | broadcast (свободные) | изменение очереди на арене |
+| `room_created` | отправителю | комната создана при нажатии Play |
+| `invite_window_start` | отправителю | начало 5-сек окна приглашений |
+| `invite_window_end` | отправителю | окно приглашений закрылось |
+| `room_updated` | отправителю | комната обновлена (напр. стала приватной) |
+| `invite_sent` | отправителю | инвайт другу отправлен |
+| `searching_opponent` | отправителю | начат публичный поиск оппонента |
+| `opponent_joined` | обоим | оппонент подключился (реальный или бот) |
+| `play_cancelled` | отправителю | поиск отменён, ставка возвращена |
+| `room_info` | broadcast (комната) | при запросе get_room_info |
 | `game_countdown` | broadcast (комната) | обратный отсчёт (5 сек) |
-| `countdown_cancelled` | broadcast (комната) | отсчёт отменён |
+| `countdown_cancelled` | broadcast (комната) | отсчёт отменён (оппонент ушёл) |
 | `game_started` | broadcast (комната) | игра началась |
 | `request_bombs` | broadcast (комната) | запрос на расстановку бомб |
 | `bombs_phase_update` | broadcast (комната) | таймер фазы бомб |
@@ -1095,9 +1514,10 @@ ws://host:3000?token=...    ─────────────────�
 | `request_move` | ходящему | запрос хода |
 | `opponent_move` | ожидающему | оппонент ходит |
 | `move_timer_update` | broadcast (комната) | таймер хода |
-| `move_result` | broadcast (комната) | результат хода |
-| `game_finished` | broadcast (комната) | игра окончена |
-| `shop_items` | отправителю | список предметов |
+| `move_result` | broadcast (комната) | результат хода (с анимациями) |
+| `game_finished` | broadcast (комната) | игра окончена (с анимациями) |
+| `left_room` | отправителю | вышел из комнаты |
+| `shop_items` | отправителю | список предметов (6 типов) |
 | `purchase_success` | отправителю | покупка успешна |
 | `equip_success` | отправителю | экипировка успешна |
 | `friends_list` | отправителю | список друзей |
