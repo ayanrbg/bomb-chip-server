@@ -950,7 +950,11 @@ function startGameCountdown(roomId) {
     if (timeLeft <= 0) {
       clearInterval(interval);
       roomCountdowns.delete(roomId);
-      await launchGame(roomId);
+      try {
+        await launchGame(roomId);
+      } catch (err) {
+        console.error("launchGame error for room", roomId, err);
+      }
     }
   }, 1000);
 
@@ -959,15 +963,16 @@ function startGameCountdown(roomId) {
 
 // ===== Запуск игры после countdown =====
 async function launchGame(roomId) {
+  console.log("[launchGame] starting for room", roomId);
   const state = roomState.get(roomId);
-  if (!state) return;
+  if (!state) { console.log("[launchGame] no state for room", roomId); return; }
 
   const roomResult = await pool.query(
     "SELECT * FROM rooms WHERE id = $1",
     [roomId]
   );
 
-  if (roomResult.rows.length === 0) return;
+  if (roomResult.rows.length === 0) { console.log("[launchGame] room not found in DB", roomId); return; }
 
   const room = roomResult.rows[0];
   const bot = activeBots.get(roomId);
@@ -975,7 +980,7 @@ async function launchGame(roomId) {
   const player1Id = room.host_id;
   const player2Id = bot ? bot.id : room.guest_id;
 
-  if (!player1Id || !player2Id) return;
+  if (!player1Id || !player2Id) { console.log("[launchGame] missing player ids", { player1Id, player2Id, roomId }); return; }
 
   // Обновляем статус
   await pool.query(
@@ -1004,6 +1009,7 @@ async function launchGame(roomId) {
 
   activeGames.set(roomId, game);
 
+  console.log("[launchGame] broadcasting game_started for room", roomId);
   broadcast(roomId, { type: "game_started" });
   broadcast(roomId, { type: "request_bombs" });
 
