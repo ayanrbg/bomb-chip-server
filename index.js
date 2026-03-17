@@ -1,5 +1,5 @@
 import admin from "firebase-admin";
-import serviceAccount from "./firebase-service-account.json" with { type: "json" };
+import serviceAccount from "./bomb-chip-75701-firebase-adminsdk-fbsvc-bdb95a9e4d.json" with { type: "json" };
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
@@ -314,11 +314,13 @@ async function finishGame(roomId, winnerId) {
     const loserId = playerIds.find(id => id !== Number(winnerId));
 
     // Только реальный игрок получает приз
+    let winnerNewBalance = null;
     if (!bot || Number(winnerId) !== bot.id) {
-      await client.query(
-        "UPDATE users SET balance = balance + $1 WHERE id = $2",
+      const balResult = await client.query(
+        "UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING balance",
         [totalPrize, winnerId]
       );
+      winnerNewBalance = balResult.rows[0].balance;
     }
 
     await client.query(
@@ -342,9 +344,15 @@ async function finishGame(roomId, winnerId) {
       payload.arenaCode = room.arena_code;
     }
 
-    broadcast(roomId, {
-      type: "game_finished",
-      payload
+    // Send newBalance individually to winner and clear roomId
+    wss.clients.forEach(c => {
+      if (c.roomId !== roomId || !c.user) return;
+      const msg = { type: "game_finished", payload: { ...payload } };
+      if (c.user.id === Number(winnerId) && winnerNewBalance !== null) {
+        msg.payload.newBalance = winnerNewBalance;
+      }
+      c.send(JSON.stringify(msg));
+      c.roomId = null;
     });
 
   } catch (err) {
@@ -428,6 +436,7 @@ function finishBombsPhase(roomId) {
     }
   });
 
+  game.phase = "playing";
   broadcast(roomId, { type: "bombs_phase_finished" });
   startMoveTimer(roomId);
 }
@@ -698,9 +707,9 @@ function getQueueCounts() {
     const arenaId = parseInt(key.split("_")[0]);
     counts.set(arenaId, (counts.get(arenaId) || 0) + rooms.length);
   }
-  // Также считаем комнаты в invite_window как "в поиске"
+  // Также считаем комнаты в invite_window как "в поиске" (searching уже в waitingRooms)
   for (const [, state] of roomState) {
-    if (state.status === "invite_window" || state.status === "searching") {
+    if (state.status === "invite_window") {
       const arenaId = state.arenaId;
       counts.set(arenaId, (counts.get(arenaId) || 0) + 1);
     }
@@ -1264,6 +1273,7 @@ wss.on("connection", async (ws, req) => {
           // Списываем ставку атомарно
           const client = await pool.connect();
           let roomId;
+          let newBalance;
           try {
             await client.query("BEGIN");
 
@@ -1277,11 +1287,13 @@ wss.on("connection", async (ws, req) => {
               return ws.send(JSON.stringify({ type: "error", message: "Not enough balance" }));
             }
 
+            newBalance = userResult.rows[0].balance;
             if (bet > 0) {
-              await client.query(
-                "UPDATE users SET balance = balance - $1 WHERE id = $2",
+              const balResult = await client.query(
+                "UPDATE users SET balance = balance - $1 WHERE id = $2 RETURNING balance",
                 [bet, ws.user.id]
               );
+              newBalance = balResult.rows[0].balance;
             }
 
             // Создаём комнату
@@ -1321,7 +1333,7 @@ wss.on("connection", async (ws, req) => {
           // Отправляем клиенту
           ws.send(JSON.stringify({
             type: "room_created",
-            payload: { roomId, arenaId, bet }
+            payload: { roomId, arenaId, bet, newBalance }
           }));
 
           ws.send(JSON.stringify({
@@ -1466,6 +1478,7 @@ wss.on("connection", async (ws, req) => {
         }
 
         // Списываем ставку у друга
+        let inviteNewBalance = null;
         const client = await pool.connect();
         try {
           await client.query("BEGIN");
@@ -1480,11 +1493,13 @@ wss.on("connection", async (ws, req) => {
             return ws.send(JSON.stringify({ type: "error", message: "Not enough balance" }));
           }
 
+          inviteNewBalance = userResult.rows[0].balance;
           if (state.bet > 0) {
-            await client.query(
-              "UPDATE users SET balance = balance - $1 WHERE id = $2",
+            const balResult = await client.query(
+              "UPDATE users SET balance = balance - $1 WHERE id = $2 RETURNING balance",
               [state.bet, ws.user.id]
             );
+            inviteNewBalance = balResult.rows[0].balance;
           }
 
           // Добавляем в комнату
@@ -1506,6 +1521,12 @@ wss.on("connection", async (ws, req) => {
         } finally {
           client.release();
         }
+
+        // Отправляем newBalance принявшему инвайт
+        ws.send(JSON.stringify({
+          type: "balance_update",
+          payload: { newBalance: inviteNewBalance }
+        }));
 
         ws.roomId = inviteRoomId;
 
@@ -1538,14 +1559,19 @@ wss.on("connection", async (ws, req) => {
         }
 
         // Рефанд ставки
+        let cancelNewBalance = null;
         const roomResult = await pool.query("SELECT bet FROM rooms WHERE id = $1", [roomId]);
         if (roomResult.rows.length > 0) {
           const bet = roomResult.rows[0].bet;
           if (bet > 0) {
-            await pool.query(
-              "UPDATE users SET balance = balance + $1 WHERE id = $2",
+            const balResult = await pool.query(
+              "UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING balance",
               [bet, ws.user.id]
             );
+            cancelNewBalance = balResult.rows[0].balance;
+          } else {
+            const balResult = await pool.query("SELECT balance FROM users WHERE id = $1", [ws.user.id]);
+            cancelNewBalance = balResult.rows[0].balance;
           }
         }
 
@@ -1559,7 +1585,7 @@ wss.on("connection", async (ws, req) => {
 
         ws.send(JSON.stringify({
           type: "play_cancelled",
-          payload: { refunded: true }
+          payload: { refunded: true, newBalance: cancelNewBalance }
         }));
 
         broadcastArenaQueueUpdate();
@@ -1596,13 +1622,16 @@ wss.on("connection", async (ws, req) => {
 
             if (winnerId && !bot) {
               // Реальный оппонент — он побеждает
+              const totalPrize = room.bet * 2;
               const client = await pool.connect();
+              let winnerNewBalance = null;
               try {
                 await client.query("BEGIN");
-                await client.query(
-                  "UPDATE users SET balance = balance + $1 WHERE id = $2",
-                  [room.bet * 2, winnerId]
+                const balResult = await client.query(
+                  "UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING balance",
+                  [totalPrize, winnerId]
                 );
+                winnerNewBalance = balResult.rows[0].balance;
                 await client.query("DELETE FROM rooms WHERE id = $1", [roomId]);
                 await client.query("COMMIT");
               } catch (err) {
@@ -1612,12 +1641,30 @@ wss.on("connection", async (ws, req) => {
                 client.release();
               }
 
-              // Уведомляем оппонента
+              // Получаем arenaCode
+              const arenaResult = await pool.query(
+                "SELECT code FROM arenas WHERE id = $1", [room.arena_id]
+              );
+              const arenaCode = arenaResult.rows[0]?.code || null;
+
+              // Уведомляем оппонента с полным payload
+              const loserId = ws.user.id;
               wss.clients.forEach(c => {
                 if (c.readyState === 1 && c.user?.id === winnerId) {
+                  const finishPayload = {
+                    winnerId,
+                    loserId,
+                    prize: totalPrize,
+                    reason: "opponent_left",
+                    newBalance: winnerNewBalance
+                  };
+                  if (room.arena_id) {
+                    finishPayload.arenaId = room.arena_id;
+                    finishPayload.arenaCode = arenaCode;
+                  }
                   c.send(JSON.stringify({
                     type: "game_finished",
-                    payload: { winnerId, reason: "opponent_left" }
+                    payload: finishPayload
                   }));
                   c.roomId = null;
                 }
@@ -1645,11 +1692,16 @@ wss.on("connection", async (ws, req) => {
             cleanupGame(roomId);
 
             // Рефанд уходящему
+            let countdownNewBalance = null;
             if (room.bet > 0) {
-              await pool.query(
-                "UPDATE users SET balance = balance + $1 WHERE id = $2",
+              const balResult = await pool.query(
+                "UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING balance",
                 [room.bet, ws.user.id]
               );
+              countdownNewBalance = balResult.rows[0].balance;
+            } else {
+              const balResult = await pool.query("SELECT balance FROM users WHERE id = $1", [ws.user.id]);
+              countdownNewBalance = balResult.rows[0].balance;
             }
 
             if (bot) {
@@ -1657,7 +1709,7 @@ wss.on("connection", async (ws, req) => {
               await pool.query("DELETE FROM rooms WHERE id = $1", [roomId]);
               fullRoomCleanup(roomId);
               ws.roomId = null;
-              return ws.send(JSON.stringify({ type: "left_room" }));
+              return ws.send(JSON.stringify({ type: "left_room", payload: { newBalance: countdownNewBalance } }));
             }
 
             // Оппонент реальный — он остаётся, комната переходит в поиск
@@ -1694,16 +1746,21 @@ wss.on("connection", async (ws, req) => {
             }
 
             ws.roomId = null;
-            return ws.send(JSON.stringify({ type: "left_room" }));
+            return ws.send(JSON.stringify({ type: "left_room", payload: { newBalance: countdownNewBalance } }));
           }
 
           // ===== ДО МАТЧА (invite_window / searching / private_waiting) =====
           // Рефанд
+          let preMatchNewBalance = null;
           if (room.bet > 0) {
-            await pool.query(
-              "UPDATE users SET balance = balance + $1 WHERE id = $2",
+            const balResult = await pool.query(
+              "UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING balance",
               [room.bet, ws.user.id]
             );
+            preMatchNewBalance = balResult.rows[0].balance;
+          } else {
+            const balResult = await pool.query("SELECT balance FROM users WHERE id = $1", [ws.user.id]);
+            preMatchNewBalance = balResult.rows[0].balance;
           }
 
           await pool.query("DELETE FROM rooms WHERE id = $1", [roomId]);
@@ -1711,7 +1768,7 @@ wss.on("connection", async (ws, req) => {
 
           ws.roomId = null;
 
-          ws.send(JSON.stringify({ type: "left_room" }));
+          ws.send(JSON.stringify({ type: "left_room", payload: { newBalance: preMatchNewBalance } }));
           broadcastArenaQueueUpdate();
 
         } catch (err) {
@@ -1851,13 +1908,15 @@ wss.on("connection", async (ws, req) => {
             delete game.disconnected[ws.user.id];
           }
 
+          const boardState = game.getStateForPlayer(ws.user.id);
           ws.send(JSON.stringify({
             type: "game_state_restore",
             payload: {
               phase: game.phase,
               turn: game.turn,
               bombsTimeLeft: game.bombsTimeLeft,
-              moveTimeLeft: game.moveTimeLeft
+              moveTimeLeft: game.moveTimeLeft,
+              board: boardState
             }
           }));
 
@@ -1954,8 +2013,8 @@ wss.on("connection", async (ws, req) => {
             return ws.send(JSON.stringify({ type: "error", message: "Not enough balance" }));
           }
 
-          await client.query(
-            "UPDATE users SET balance = balance - $1 WHERE id = $2",
+          const balResult = await client.query(
+            "UPDATE users SET balance = balance - $1 WHERE id = $2 RETURNING balance",
             [item.price, ws.user.id]
           );
 
@@ -1968,7 +2027,7 @@ wss.on("connection", async (ws, req) => {
 
           ws.send(JSON.stringify({
             type: "purchase_success",
-            payload: { itemId }
+            payload: { itemId, newBalance: balResult.rows[0].balance }
           }));
         } catch (err) {
           await client.query("ROLLBACK");

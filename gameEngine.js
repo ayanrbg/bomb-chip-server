@@ -104,6 +104,41 @@ export class GameEngine {
   }
 
   // =========================
+  // Состояние для реконнекта
+  // =========================
+  getStateForPlayer(playerId) {
+    playerId = Number(playerId);
+    const opponentId = Object.keys(this.players)
+      .map(Number)
+      .find(id => id !== playerId);
+
+    const player = this.players[playerId];
+    const opponent = this.players[opponentId];
+
+    if (!player || !opponent) return null;
+
+    // Клетки, которые атаковал этот игрок (на доске оппонента)
+    const yourAttacks = [...opponent.revealed].map(cell => ({
+      cell,
+      bomb: opponent.bombs.includes(cell)
+    }));
+
+    // Клетки, которые атаковал оппонент (на доске этого игрока)
+    const opponentAttacks = [...player.revealed].map(cell => ({
+      cell,
+      bomb: player.bombs.includes(cell)
+    }));
+
+    return {
+      yourLives: player.lives,
+      opponentLives: opponent.lives,
+      yourBombs: player.bombs,
+      yourAttacks,
+      opponentAttacks
+    };
+  }
+
+  // =========================
   // Установка бомб
   // =========================
   placeBombs(playerId, bombs) {

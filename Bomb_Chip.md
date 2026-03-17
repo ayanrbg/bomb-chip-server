@@ -11,13 +11,14 @@
 3. [Автоматические сообщения при подключении](#3-автоматические-сообщения-при-подключении)
 4. [Арены (локации)](#4-арены-локации)
 5. [Матчмейкинг](#5-матчмейкинг)
-6. [Игровой процесс](#7-игровой-процесс)
-7. [Магазин и кастомизация](#8-магазин-и-кастомизация)
-8. [Друзья и инвайты](#9-друзья-и-инвайты)
-9. [Реконнект](#10-реконнект)
-10. [Ошибки](#11-ошибки)
-11. [Полный игровой цикл — Публичная игра](#12-полный-игровой-цикл--публичная-игра)
-12. [Полный игровой цикл — Игра с другом](#13-полный-игровой-цикл--игра-с-другом)
+6. [Игровой процесс](#6-игровой-процесс)
+7. [Магазин и кастомизация](#7-магазин-и-кастомизация)
+8. [Друзья и инвайты](#8-друзья-и-инвайты)
+9. [Реконнект](#9-реконнект)
+10. [Ошибки](#10-ошибки)
+11. [Полный игровой цикл — Публичная игра](#11-полный-игровой-цикл--публичная-игра)
+12. [Полный игровой цикл — Игра с другом](#12-полный-игровой-цикл--игра-с-другом)
+13. [Полный игровой цикл — Игра с ботом](#13-полный-игровой-цикл--игра-с-ботом)
 
 ---
 
@@ -134,6 +135,11 @@ ws://<host>:3000?token=<JWT_TOKEN>
 
 Клиент отправляет: `{ "type": "...", ... доп. поля }`
 Сервер отвечает: `{ "type": "...", "payload": { ... } }`
+
+> **Примечания к формату:**
+> - `payload` — **опциональное** поле. Некоторые сообщения приходят без него (например, `searching_opponent`, `game_started`, `request_bombs`, `bombs_placed`, `bombs_phase_finished`). Клиент должен обрабатывать `payload` как необязательное.
+> - Ошибки имеют **особый формат**: `{ "type": "error", "message": "..." }` — поле `message` в корне объекта, не внутри `payload`. Это intentional.
+> - Поле `skin_index` в `user_customization` может приходить как **строка** (особенность pg-драйвера для `COUNT(*)`). Приводите к числу на клиенте.
 
 ---
 
@@ -295,7 +301,8 @@ ws://<host>:3000?token=<JWT_TOKEN>
   "payload": {
     "roomId": 42,
     "arenaId": 1,
-    "bet": 50
+    "bet": 50,
+    "newBalance": 950
   }
 }
 ```
@@ -397,9 +404,18 @@ ws://<host>:3000?token=<JWT_TOKEN>
 
 **Логика:**
 1. Ставка списывается с баланса приглашённого
-2. Приглашённый добавляется в комнату
-3. Окно приглашений отменяется
-4. Начинается countdown к старту
+2. Приглашённому отправляется `balance_update` с `newBalance`
+3. Приглашённый добавляется в комнату
+4. Окно приглашений отменяется
+5. Начинается countdown к старту
+
+**SERVER → balance_update** (приглашённому)
+```json
+{
+  "type": "balance_update",
+  "payload": { "newBalance": 900 }
+}
+```
 
 **SERVER → opponent_joined** (обоим игрокам, далее см. [5.5](#55-оппонент-найден))
 
@@ -455,7 +471,7 @@ ws://<host>:3000?token=<JWT_TOKEN>
 ```json
 {
   "type": "play_cancelled",
-  "payload": { "refunded": true }
+  "payload": { "refunded": true, "newBalance": 1000 }
 }
 ```
 
@@ -527,7 +543,10 @@ ws://<host>:3000?token=<JWT_TOKEN>
 
 **SERVER → left_room** (отправителю)
 ```json
-{ "type": "left_room" }
+{
+  "type": "left_room",
+  "payload": { "newBalance": 1000 }
+}
 ```
 
 **Логика по статусам:**
@@ -895,6 +914,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
     "prize": 100,
     "arenaId": 1,
     "arenaCode": "backyard",
+    "newBalance": 1100,
     "animations": [
       {
         "userId": 5,
@@ -915,18 +935,25 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 }
 ```
 
+> `newBalance` приходит **только победителю**. Проигравший не получает `newBalance` (его баланс не изменился — ставка уже была списана при `play`).
+
 Победа по выходу противника:
 ```json
 {
   "type": "game_finished",
   "payload": {
     "winnerId": 5,
-    "reason": "opponent_left"
+    "loserId": 8,
+    "prize": 100,
+    "reason": "opponent_left",
+    "arenaId": 1,
+    "arenaCode": "backyard",
+    "newBalance": 1100
   }
 }
 ```
 
-> `prize` = `bet × 2`. Выигрыш начисляется на баланс победителя автоматически.
+> `prize` = `bet × 2`. Выигрыш начисляется на баланс победителя автоматически. При `reason: "opponent_left"` анимации не отправляются.
 
 ---
 
@@ -1012,7 +1039,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 ```json
 {
   "type": "purchase_success",
-  "payload": { "itemId": 6 }
+  "payload": { "itemId": 6, "newBalance": 500 }
 }
 ```
 
@@ -1177,7 +1204,20 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
     "phase": "playing",
     "turn": 5,
     "bombsTimeLeft": 0,
-    "moveTimeLeft": 12
+    "moveTimeLeft": 12,
+    "board": {
+      "yourLives": 3,
+      "opponentLives": 2,
+      "yourBombs": [0, 5, 11],
+      "yourAttacks": [
+        { "cell": 3, "bomb": true },
+        { "cell": 7, "bomb": false }
+      ],
+      "opponentAttacks": [
+        { "cell": 0, "bomb": false },
+        { "cell": 5, "bomb": true }
+      ]
+    }
   }
 }
 ```
@@ -1188,6 +1228,19 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 | `turn` | integer | userId текущего ходящего |
 | `bombsTimeLeft` | integer | Оставшееся время фазы бомб |
 | `moveTimeLeft` | integer | Оставшееся время на ход |
+| `board` | object | Полное состояние доски (см. ниже) |
+
+**Поля `board`:**
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| `yourLives` | integer | Оставшиеся жизни игрока |
+| `opponentLives` | integer | Оставшиеся жизни оппонента |
+| `yourBombs` | integer[] | Позиции бомб игрока (0-11) |
+| `yourAttacks` | array | Клетки, атакованные игроком на доске оппонента |
+| `opponentAttacks` | array | Клетки, атакованные оппонентом на доске игрока |
+
+> `yourAttacks[].cell` — индекс клетки, `yourAttacks[].bomb` — была ли там бомба.
 
 После `game_state_restore` также приходит `request_move` или `opponent_move` с актуальным состоянием и `room_info`.
 
@@ -1502,7 +1555,8 @@ ws://host:3000?token=...    ─────────────────�
 | `invite_sent` | отправителю | инвайт другу отправлен |
 | `searching_opponent` | отправителю | начат публичный поиск оппонента |
 | `opponent_joined` | обоим | оппонент подключился (реальный или бот) |
-| `play_cancelled` | отправителю | поиск отменён, ставка возвращена |
+| `balance_update` | отправителю | баланс обновлён (при accept_invite) |
+| `play_cancelled` | отправителю | поиск отменён, ставка возвращена (с newBalance) |
 | `room_info` | broadcast (комната) | при запросе get_room_info |
 | `game_countdown` | broadcast (комната) | обратный отсчёт (5 сек) |
 | `countdown_cancelled` | broadcast (комната) | отсчёт отменён (оппонент ушёл) |
@@ -1516,9 +1570,9 @@ ws://host:3000?token=...    ─────────────────�
 | `move_timer_update` | broadcast (комната) | таймер хода |
 | `move_result` | broadcast (комната) | результат хода (с анимациями) |
 | `game_finished` | broadcast (комната) | игра окончена (с анимациями) |
-| `left_room` | отправителю | вышел из комнаты |
+| `left_room` | отправителю | вышел из комнаты (с newBalance) |
 | `shop_items` | отправителю | список предметов (6 типов) |
-| `purchase_success` | отправителю | покупка успешна |
+| `purchase_success` | отправителю | покупка успешна (с newBalance) |
 | `equip_success` | отправителю | экипировка успешна |
 | `friends_list` | отправителю | список друзей |
 | `friend_request_sent` | отправителю | заявка отправлена |
@@ -1527,5 +1581,5 @@ ws://host:3000?token=...    ─────────────────�
 | `friend_request_accepted` | отправителю заявки | заявка принята |
 | `game_invite_received` | приглашённому | приглашение в комнату |
 | `reconnect_ok` | отправителю | результат реконнекта |
-| `game_state_restore` | отправителю | восстановление состояния игры |
+| `game_state_restore` | отправителю | восстановление состояния игры (с board) |
 | `error` | отправителю | ошибка |
