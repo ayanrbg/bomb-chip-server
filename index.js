@@ -11,8 +11,13 @@ import { createBot, botPlaceBombs, botChooseCell } from "./botPlayer.js";
 const activeGames = new Map();
 const roomCountdowns = new Map();
 
+// ===== Grid defaults =====
+const DEFAULT_GRID_ROWS = 3;
+const DEFAULT_GRID_COLS = 5;
+const DEFAULT_BOMB_COUNT = 3;
+
 // ===== Новая Matchmaking система =====
-// roomState: roomId -> { status, arenaId, bet, player1Id, player1Ws, isPrivate, inviteTimer, botTimer }
+// roomState: roomId -> { status, arenaId, bet, player1Id, player1Ws, isPrivate, inviteTimer, botTimer, gridRows, gridCols, bombCount }
 // status: 'invite_window' | 'private_waiting' | 'searching' | 'matched' | 'playing'
 const roomState = new Map();
 
@@ -99,9 +104,11 @@ app.post("/firebase-login", async (req, res) => {
 
         await client.query(`
           INSERT INTO user_customization
-          (user_id, skin_id, effect_id, animation_hit_id, animation_miss_id, animation_win_id, animation_lose_id)
+          (user_id, model_id, item_model_id, skin_id, effect_id, animation_hit_id, animation_miss_id, animation_win_id, animation_lose_id)
           VALUES (
             $1,
+            (SELECT id FROM shop_items WHERE code = 'character_default' LIMIT 1),
+            (SELECT id FROM shop_items WHERE code = 'default_chip' LIMIT 1),
             $2,
             (SELECT id FROM shop_items WHERE code = 'default_effect'),
             (SELECT id FROM shop_items WHERE code = 'default_anim' LIMIT 1),
@@ -196,9 +203,11 @@ app.post("/register", async (req, res) => {
 
     await client.query(`
       INSERT INTO user_customization
-      (user_id, skin_id, effect_id, animation_hit_id, animation_miss_id, animation_win_id, animation_lose_id)
+      (user_id, model_id, item_model_id, skin_id, effect_id, animation_hit_id, animation_miss_id, animation_win_id, animation_lose_id)
       VALUES (
         $1,
+        (SELECT id FROM shop_items WHERE code = 'character_default' LIMIT 1),
+        (SELECT id FROM shop_items WHERE code = 'default_chip' LIMIT 1),
         $2,
         (SELECT id FROM shop_items WHERE code = 'default_effect'),
         (SELECT id FROM shop_items WHERE code = 'default_anim' LIMIT 1),
@@ -419,15 +428,15 @@ function finishBombsPhase(roomId) {
 
   // Авто-расстановка для тех кто не поставил (включая ботов — на случай если таймер сработал раньше)
   Object.entries(game.players).forEach(([playerId, player]) => {
-    if (player.bombs.length < 3) {
+    if (player.bombs.length < game.bombCount) {
       const available = [];
-      for (let i = 0; i < 12; i++) {
+      for (let i = 0; i < game.totalCells; i++) {
         if (!player.bombs.includes(i)) {
           available.push(i);
         }
       }
 
-      while (player.bombs.length < 3) {
+      while (player.bombs.length < game.bombCount) {
         const rand = available.splice(
           Math.floor(Math.random() * available.length), 1
         )[0];
@@ -459,7 +468,7 @@ async function autoMove(roomId) {
     const opponent = game.players[opponentId];
 
     const available = [];
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < game.totalCells; i++) {
       if (!opponent.revealed.has(i)) {
         available.push(i);
       }
@@ -542,7 +551,7 @@ function sendTurnState(roomId) {
     if (!player || !opponent) return;
 
     const availableCells = [];
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < game.totalCells; i++) {
       if (!opponent.revealed.has(i)) {
         availableCells.push(i);
       }
@@ -584,6 +593,8 @@ function sendTurnState(roomId) {
 async function loadPlayerCustomization(playerId) {
   const result = await pool.query(`
     SELECT
+      s_model.code as model_code,
+      s_item_model.code as item_model_code,
       s_skin.code as skin_code,
       s_effect.code as effect_code,
       s_hit.code as animation_hit_code,
@@ -591,6 +602,8 @@ async function loadPlayerCustomization(playerId) {
       s_win.code as animation_win_code,
       s_lose.code as animation_lose_code
     FROM user_customization uc
+    LEFT JOIN shop_items s_model ON uc.model_id = s_model.id
+    LEFT JOIN shop_items s_item_model ON uc.item_model_id = s_item_model.id
     LEFT JOIN shop_items s_skin ON uc.skin_id = s_skin.id
     LEFT JOIN shop_items s_effect ON uc.effect_id = s_effect.id
     LEFT JOIN shop_items s_hit ON uc.animation_hit_id = s_hit.id
@@ -601,6 +614,8 @@ async function loadPlayerCustomization(playerId) {
   `, [playerId]);
 
   return result.rows[0] || {
+    model_code: "character_default",
+    item_model_code: "default_chip",
     skin_code: "default_skin1",
     effect_code: "default_effect",
     animation_hit_code: "default_anim",
@@ -624,9 +639,9 @@ function scheduleBotBombs(roomId) {
     if (!game || game.phase !== "placing_bombs") return;
 
     // Если бот уже поставил бомбы, пропускаем
-    if (game.players[bot.id]?.bombs?.length === 3) return;
+    if (game.players[bot.id]?.bombs?.length === game.bombCount) return;
 
-    const bombs = botPlaceBombs();
+    const bombs = botPlaceBombs(game.bombCount, game.totalCells);
     const result = game.placeBombs(bot.id, bombs);
 
     if (result.gameStarted) {
@@ -657,7 +672,7 @@ function scheduleBotMove(roomId) {
         .find(id => id !== bot.id);
 
       const opponent = game.players[opponentId];
-      const cell = botChooseCell(opponent.revealed);
+      const cell = botChooseCell(opponent.revealed, game.totalCells);
       if (cell === null) return;
 
       const result = game.makeMove(bot.id, cell);
@@ -845,6 +860,10 @@ async function matchPlayers(roomId, state, opponentWs, opponentId) {
 
   const hostNickname = hostWs.user?.nickname || "Player";
 
+  const gridRows = state.gridRows || DEFAULT_GRID_ROWS;
+  const gridCols = state.gridCols || DEFAULT_GRID_COLS;
+  const bombCount = state.bombCount || DEFAULT_BOMB_COUNT;
+
   // Уведомляем обоих
   if (hostWs.readyState === 1) {
     hostWs.send(JSON.stringify({
@@ -857,9 +876,14 @@ async function matchPlayers(roomId, state, opponentWs, opponentId) {
         opponent: {
           id: opponentId,
           nickname: opponentNickname,
+          model_code: custom2.model_code || "character_default",
+          item_model_code: custom2.item_model_code || "default_chip",
           skin_code: custom2.skin_code,
           effect_code: custom2.effect_code
-        }
+        },
+        gridRows,
+        gridCols,
+        bombCount
       }
     }));
   }
@@ -875,9 +899,14 @@ async function matchPlayers(roomId, state, opponentWs, opponentId) {
         opponent: {
           id: hostId,
           nickname: hostNickname,
+          model_code: custom1.model_code || "character_default",
+          item_model_code: custom1.item_model_code || "default_chip",
           skin_code: custom1.skin_code,
           effect_code: custom1.effect_code
-        }
+        },
+        gridRows,
+        gridCols,
+        bombCount
       }
     }));
   }
@@ -906,6 +935,10 @@ async function connectBot(roomId) {
   );
   const arena = arenaResult.rows[0];
 
+  const gridRows = state.gridRows || DEFAULT_GRID_ROWS;
+  const gridCols = state.gridCols || DEFAULT_GRID_COLS;
+  const bombCount = state.bombCount || DEFAULT_BOMB_COUNT;
+
   if (hostWs.readyState === 1) {
     hostWs.send(JSON.stringify({
       type: "opponent_joined",
@@ -917,9 +950,14 @@ async function connectBot(roomId) {
         opponent: {
           id: bot.id,
           nickname: bot.nickname,
+          model_code: bot.customization.model_code,
+          item_model_code: bot.customization.item_model_code,
           skin_code: bot.customization.skin_code,
           effect_code: bot.customization.effect_code
-        }
+        },
+        gridRows,
+        gridCols,
+        bombCount
       }
     }));
   }
@@ -994,7 +1032,11 @@ async function launchGame(roomId) {
     ? [player1Id, player2Id]
     : [player2Id, player1Id];
 
-  const game = new GameEngine(roomId, ids[0], ids[1]);
+  const gridRows = state.gridRows || DEFAULT_GRID_ROWS;
+  const gridCols = state.gridCols || DEFAULT_GRID_COLS;
+  const bombCount = state.bombCount || DEFAULT_BOMB_COUNT;
+
+  const game = new GameEngine(roomId, ids[0], ids[1], gridRows, gridCols, bombCount);
 
   // Загружаем кастомизацию
   const custom1 = await loadPlayerCustomization(player1Id);
@@ -1011,7 +1053,15 @@ async function launchGame(roomId) {
 
   console.log("[launchGame] broadcasting game_started for room", roomId);
   broadcast(roomId, { type: "game_started" });
-  broadcast(roomId, { type: "request_bombs" });
+  broadcast(roomId, {
+    type: "request_bombs",
+    payload: {
+      gridRows: game.gridRows,
+      gridCols: game.gridCols,
+      bombCount: game.bombCount,
+      timeLeft: game.bombsTimeLeft
+    }
+  });
 
   startBombsTimer(roomId);
 
@@ -1080,6 +1130,19 @@ async function broadcastRoomInfo(roomId) {
   const state = roomState.get(roomId);
   const bot = activeBots.get(roomId);
 
+  // Загружаем кастомизацию для model_code и item_model_code
+  let p1Custom = null, p2Custom = null;
+  if (room.player1_id) {
+    p1Custom = await loadPlayerCustomization(room.player1_id);
+  }
+  if (room.player2_id) {
+    p2Custom = await loadPlayerCustomization(room.player2_id);
+  }
+
+  const gridRows = state?.gridRows || DEFAULT_GRID_ROWS;
+  const gridCols = state?.gridCols || DEFAULT_GRID_COLS;
+  const bombCount = state?.bombCount || DEFAULT_BOMB_COUNT;
+
   const payload = {
     type: "room_info",
     payload: {
@@ -1087,17 +1150,26 @@ async function broadcastRoomInfo(roomId) {
       status: state?.status || room.status,
       bet: room.bet,
       arenaId: room.arena_id,
+      gridRows,
+      gridCols,
+      bombCount,
       player1: room.player1_id ? {
         id: room.player1_id,
-        nickname: room.player1_nickname
+        nickname: room.player1_nickname,
+        model_code: p1Custom?.model_code || "character_default",
+        item_model_code: p1Custom?.item_model_code || "default_chip"
       } : null,
       player2: bot ? {
         id: bot.id,
         nickname: bot.nickname,
+        model_code: bot.customization.model_code,
+        item_model_code: bot.customization.item_model_code,
         isBot: true
       } : (room.player2_id ? {
         id: room.player2_id,
-        nickname: room.player2_nickname
+        nickname: room.player2_nickname,
+        model_code: p2Custom?.model_code || "character_default",
+        item_model_code: p2Custom?.item_model_code || "default_chip"
       } : null)
     }
   };
@@ -1153,21 +1225,25 @@ wss.on("connection", async (ws, req) => {
     // Отправляем кастомизацию игроку
     const customizationResult = await pool.query(`
       SELECT
+        s_model.code as model_code,
+        s_item_model.code as item_model_code,
         uc.skin_id,
-        uc.effect_id,
-        uc.animation_hit_id,
-        uc.animation_miss_id,
-        uc.animation_win_id,
-        uc.animation_lose_id,
         s_skin.code as skin_code,
-        s_effect.code as effect_code,
-        s_hit.code as animation_hit_code,
-        s_miss.code as animation_miss_code,
-        s_win.code as animation_win_code,
-        s_lose.code as animation_lose_code,
         (SELECT COUNT(*) FROM shop_items WHERE type='skin' AND id <= uc.skin_id) as skin_index,
-        (SELECT COUNT(*) FROM shop_items WHERE type='effect' AND id <= uc.effect_id) as effect_index
+        uc.effect_id,
+        s_effect.code as effect_code,
+        (SELECT COUNT(*) FROM shop_items WHERE type='effect' AND id <= uc.effect_id) as effect_index,
+        uc.animation_hit_id,
+        s_hit.code as animation_hit_code,
+        uc.animation_miss_id,
+        s_miss.code as animation_miss_code,
+        uc.animation_win_id,
+        s_win.code as animation_win_code,
+        uc.animation_lose_id,
+        s_lose.code as animation_lose_code
       FROM user_customization uc
+      LEFT JOIN shop_items s_model ON uc.model_id = s_model.id
+      LEFT JOIN shop_items s_item_model ON uc.item_model_id = s_item_model.id
       LEFT JOIN shop_items s_skin ON uc.skin_id = s_skin.id
       LEFT JOIN shop_items s_effect ON uc.effect_id = s_effect.id
       LEFT JOIN shop_items s_hit ON uc.animation_hit_id = s_hit.id
@@ -1331,7 +1407,10 @@ wss.on("connection", async (ws, req) => {
             player1Ws: ws,
             isPrivate: false,
             inviteTimer: null,
-            botTimer: null
+            botTimer: null,
+            gridRows: DEFAULT_GRID_ROWS,
+            gridCols: DEFAULT_GRID_COLS,
+            bombCount: DEFAULT_BOMB_COUNT
           };
 
           roomState.set(roomId, state);
@@ -1799,16 +1878,17 @@ wss.on("connection", async (ws, req) => {
 
       // ===== place_bombs =====
       if (data.type === "place_bombs") {
-        if (!Array.isArray(data.bombs) || data.bombs.length !== 3
-            || !data.bombs.every(b => Number.isInteger(b) && b >= 0 && b <= 11)) {
-          return ws.send(JSON.stringify({
-            type: "error",
-            message: "Invalid bombs: must be 3 integers 0-11"
-          }));
-        }
-
         const game = activeGames.get(ws.roomId);
         if (!game) return;
+
+        const maxCell = game.totalCells - 1;
+        if (!Array.isArray(data.bombs) || data.bombs.length !== game.bombCount
+            || !data.bombs.every(b => Number.isInteger(b) && b >= 0 && b <= maxCell)) {
+          return ws.send(JSON.stringify({
+            type: "error",
+            message: `Invalid bombs: must be ${game.bombCount} integers 0-${maxCell}`
+          }));
+        }
 
         const result = game.placeBombs(ws.user.id, data.bombs);
 
@@ -1829,16 +1909,16 @@ wss.on("connection", async (ws, req) => {
 
       // ===== make_move =====
       if (data.type === "make_move") {
+        const game = activeGames.get(ws.roomId);
+        if (!game) return;
+
         const cell = Number(data.cell);
-        if (!Number.isInteger(cell) || cell < 0 || cell > 11) {
+        if (!Number.isInteger(cell) || cell < 0 || cell >= game.totalCells) {
           return ws.send(JSON.stringify({
             type: "error",
             message: "Invalid cell"
           }));
         }
-
-        const game = activeGames.get(ws.roomId);
-        if (!game) return;
 
         if (game.processingMove) return;
         game.processingMove = true;
@@ -1915,6 +1995,36 @@ wss.on("connection", async (ws, req) => {
           }
 
           const boardState = game.getStateForPlayer(ws.user.id);
+
+          // Получаем данные оппонента для восстановления
+          const opponentId = Object.keys(game.players)
+            .map(Number)
+            .find(id => id !== ws.user.id);
+
+          let opponentData = null;
+          const reconnectBot = activeBots.get(room.id);
+          if (reconnectBot && reconnectBot.id === opponentId) {
+            opponentData = {
+              id: reconnectBot.id,
+              nickname: reconnectBot.nickname,
+              model_code: reconnectBot.customization.model_code,
+              item_model_code: reconnectBot.customization.item_model_code,
+              skin_code: reconnectBot.customization.skin_code,
+              effect_code: reconnectBot.customization.effect_code
+            };
+          } else if (opponentId) {
+            const oppResult = await pool.query("SELECT nickname FROM users WHERE id = $1", [opponentId]);
+            const oppCustom = await loadPlayerCustomization(opponentId);
+            opponentData = {
+              id: opponentId,
+              nickname: oppResult.rows[0]?.nickname || "Player",
+              model_code: oppCustom.model_code || "character_default",
+              item_model_code: oppCustom.item_model_code || "default_chip",
+              skin_code: oppCustom.skin_code,
+              effect_code: oppCustom.effect_code
+            };
+          }
+
           ws.send(JSON.stringify({
             type: "game_state_restore",
             payload: {
@@ -1922,6 +2032,10 @@ wss.on("connection", async (ws, req) => {
               turn: game.turn,
               bombsTimeLeft: game.bombsTimeLeft,
               moveTimeLeft: game.moveTimeLeft,
+              gridRows: game.gridRows,
+              gridCols: game.gridCols,
+              bombCount: game.bombCount,
+              opponent: opponentData,
               board: boardState
             }
           }));
@@ -1955,6 +2069,8 @@ wss.on("connection", async (ws, req) => {
         }
 
         const allowedColumns = {
+          model: "model_id",
+          item_model: "item_model_id",
           skin: "skin_id",
           effect: "effect_id",
           animation_hit: "animation_hit_id",
@@ -2060,7 +2176,7 @@ wss.on("connection", async (ws, req) => {
         const ownedIds = new Set(ownedResult.rows.map(r => r.item_id));
 
         const customizationResult = await pool.query(`
-          SELECT skin_id, effect_id, animation_hit_id, animation_miss_id, animation_win_id, animation_lose_id
+          SELECT model_id, item_model_id, skin_id, effect_id, animation_hit_id, animation_miss_id, animation_win_id, animation_lose_id
           FROM user_customization
           WHERE user_id = $1
         `, [ws.user.id]);
@@ -2068,6 +2184,8 @@ wss.on("connection", async (ws, req) => {
         const active = customizationResult.rows[0] || {};
 
         const typeToColumn = {
+          model: "model_id",
+          item_model: "item_model_id",
           skin: "skin_id",
           effect: "effect_id",
           animation_hit: "animation_hit_id",

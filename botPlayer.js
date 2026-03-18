@@ -8,6 +8,8 @@ const BOT_NAMES = [
 ];
 
 const DEFAULT_SKINS = ["default_skin1", "default_skin2", "default_skin3"];
+const DEFAULT_MODELS = ["character_default"];
+const DEFAULT_ITEM_MODELS = ["default_chip"];
 
 function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
@@ -23,6 +25,8 @@ export function createBot() {
     nickname: pickRandom(BOT_NAMES) + Math.floor(Math.random() * 1000),
     isBot: true,
     customization: {
+      model_code: pickRandom(DEFAULT_MODELS),
+      item_model_code: pickRandom(DEFAULT_ITEM_MODELS),
       skin_code: pickRandom(DEFAULT_SKINS),
       effect_code: "default_effect",
       animation_hit_code: "default_anim",
@@ -33,18 +37,18 @@ export function createBot() {
   };
 }
 
-export function botPlaceBombs() {
+export function botPlaceBombs(bombCount = 3, totalCells = 15) {
   const cells = [];
-  while (cells.length < 3) {
-    const cell = Math.floor(Math.random() * 12);
+  while (cells.length < bombCount) {
+    const cell = Math.floor(Math.random() * totalCells);
     if (!cells.includes(cell)) cells.push(cell);
   }
   return cells;
 }
 
-export function botChooseCell(revealedSet) {
+export function botChooseCell(revealedSet, totalCells = 15) {
   const available = [];
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < totalCells; i++) {
     if (!revealedSet.has(i)) available.push(i);
   }
   if (available.length === 0) return null;

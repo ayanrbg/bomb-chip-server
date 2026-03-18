@@ -1,9 +1,14 @@
 export class GameEngine {
 
-  constructor(roomId, hostId, guestId) {
+  constructor(roomId, hostId, guestId, gridRows = 3, gridCols = 5, bombCount = 3) {
     this.roomId = roomId;
     this.bombsTimer = null;
     this.moveTimer = null;
+
+    this.gridRows = gridRows;
+    this.gridCols = gridCols;
+    this.totalCells = gridRows * gridCols;
+    this.bombCount = bombCount;
 
     this.bombsTimeLeft = 20;   // 20 секунд на бомбы
     this.moveTimeLeft = 15;    // 15 секунд на ход
@@ -25,7 +30,7 @@ export class GameEngine {
   createPlayerState() {
     return {
       bombs: [],
-      lives: 3,
+      lives: this.bombCount,
       revealed: new Set(),
       customization: null // will be set by server after loading from DB
     };
@@ -153,23 +158,23 @@ export class GameEngine {
       return { error: "Invalid player" };
     }
 
-    if (!Array.isArray(bombs) || bombs.length !== 3) {
-      return { error: "Exactly 3 bombs required" };
+    if (!Array.isArray(bombs) || bombs.length !== this.bombCount) {
+      return { error: `Exactly ${this.bombCount} bombs required` };
     }
 
     const unique = new Set(bombs);
-    if (unique.size !== 3) {
+    if (unique.size !== this.bombCount) {
       return { error: "Bombs must be unique" };
     }
 
-    if (bombs.some(b => b < 0 || b > 11)) {
+    if (bombs.some(b => b < 0 || b >= this.totalCells)) {
       return { error: "Invalid cell index" };
     }
 
     this.players[playerId].bombs = bombs;
 
     const allPlaced = Object.values(this.players)
-      .every(p => p.bombs.length === 3);
+      .every(p => p.bombs.length === this.bombCount);
 
     if (allPlaced) {
       this.phase = "playing";

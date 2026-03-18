@@ -166,6 +166,8 @@ ws://<host>:3000?token=<JWT_TOKEN>
 {
   "type": "user_customization",
   "payload": {
+    "model_code": "character_warrior",
+    "item_model_code": "default_chip",
     "skin_id": 2,
     "skin_code": "default_skin2",
     "skin_index": "2",
@@ -184,7 +186,9 @@ ws://<host>:3000?token=<JWT_TOKEN>
 }
 ```
 
-> 6 слотов кастомизации: скин, эффект, и 4 анимации (hit, miss, win, lose).
+> 8 слотов кастомизации: модель персонажа, модель предмета на столе, скин, эффект, и 4 анимации (hit, miss, win, lose).
+> `model_code` — код 3D-модели персонажа игрока (спавнится за столом).
+> `item_model_code` — код 3D-модели предмета на столе (вместо стандартного чипа — тортик, яблоко, кристалл и т.д.).
 
 ---
 
@@ -500,16 +504,24 @@ ws://<host>:3000?token=<JWT_TOKEN>
     "opponent": {
       "id": 8,
       "nickname": "Player2",
+      "model_code": "character_mage",
+      "item_model_code": "cake",
       "skin_code": "gold_skin",
       "effect_code": "default_effect"
-    }
+    },
+    "gridRows": 3,
+    "gridCols": 5,
+    "bombCount": 3
   }
 }
 ```
 
-> В `opponent_joined` сразу передаётся кастомизация оппонента, чтобы клиент мог загрузить ассеты до начала игры.
+> В `opponent_joined` сразу передаётся кастомизация оппонента (`model_code`, `item_model_code`, `skin_code`, `effect_code`), чтобы клиент мог загрузить ассеты до начала игры.
+> `model_code` — модель персонажа оппонента. `item_model_code` — модель предметов оппонента на столе.
+> `gridRows`, `gridCols` — размер игровой сетки для каждой стороны (например 3×5 = 15 клеток). Определяется сервером (может зависеть от арены).
+> `bombCount` — количество бомб, которые каждый игрок должен расставить.
 
-> Если оппонент — бот, его `id` будет отрицательным числом. Бот имеет рандомный никнейм, скин и эффект.
+> Если оппонент — бот, его `id` будет отрицательным числом. Бот имеет рандомный никнейм, модель, предмет, скин и эффект.
 
 Сразу после `opponent_joined` начинается [обратный отсчёт](#61-обратный-отсчёт).
 
@@ -521,6 +533,8 @@ ws://<host>:3000?token=<JWT_TOKEN>
 
 **Поведение бота:**
 - Рандомный никнейм из пула (напр. `"CoolBot742"`, `"NeonWolf158"`)
+- Рандомная модель из дефолтных (`model_code`)
+- Рандомный предмет из дефолтных (`item_model_code`)
 - Рандомный скин из дефолтных
 - Дефолтные эффекты и анимации
 - Размещает бомбы с задержкой 2-4 секунды
@@ -580,9 +594,14 @@ ws://<host>:3000?token=<JWT_TOKEN>
     "status": "searching",
     "bet": 50,
     "arenaId": 1,
+    "gridRows": 3,
+    "gridCols": 5,
+    "bombCount": 3,
     "player1": {
       "id": 5,
-      "nickname": "Player1"
+      "nickname": "Player1",
+      "model_code": "character_warrior",
+      "item_model_code": "default_chip"
     },
     "player2": null
   }
@@ -598,13 +617,20 @@ ws://<host>:3000?token=<JWT_TOKEN>
     "status": "matched",
     "bet": 50,
     "arenaId": 1,
+    "gridRows": 3,
+    "gridCols": 5,
+    "bombCount": 3,
     "player1": {
       "id": 5,
-      "nickname": "Player1"
+      "nickname": "Player1",
+      "model_code": "character_warrior",
+      "item_model_code": "default_chip"
     },
     "player2": {
       "id": -1,
       "nickname": "NeonWolf158",
+      "model_code": "character_bot",
+      "item_model_code": "apple",
       "isBot": true
     }
   }
@@ -674,8 +700,20 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 
 **SERVER → request_bombs** (broadcast)
 ```json
-{ "type": "request_bombs" }
+{
+  "type": "request_bombs",
+  "payload": {
+    "gridRows": 3,
+    "gridCols": 5,
+    "bombCount": 3,
+    "timeLeft": 20
+  }
+}
 ```
+
+> `gridRows`, `gridCols` — размер сетки (дублируется из `opponent_joined` для удобства). Общее число клеток = `gridRows × gridCols`.
+> `bombCount` — количество бомб для расстановки.
+> `timeLeft` — начальное время на фазу бомб (в секундах).
 
 **SERVER → bombs_phase_update** (broadcast, каждые 2 секунды)
 ```json
@@ -697,17 +735,17 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 
 | Поле | Тип | Описание |
 |------|-----|----------|
-| `bombs` | integer[] | Ровно 3 уникальных числа от 0 до 11 |
+| `bombs` | integer[] | Ровно `bombCount` уникальных чисел от 0 до `gridRows × gridCols - 1` |
 
 **Валидация:**
-- Массив из 3 целых чисел
-- Каждое число от 0 до 11 включительно
+- Массив из `bombCount` целых чисел (по умолчанию 3)
+- Каждое число от 0 до `gridRows × gridCols - 1` включительно (по умолчанию 0-14)
 - Все числа уникальны
 
 **Ошибки:**
-- `"Invalid bombs: must be 3 integers 0-11"` — невалидный формат
+- `"Invalid bombs"` — невалидный формат
 - `"Game already started"` — фаза уже закончилась
-- `"Exactly 3 bombs required"` — не 3 бомбы
+- `"Exactly N bombs required"` — неверное количество бомб
 - `"Bombs must be unique"` — дубликаты
 - `"Invalid cell index"` — число вне диапазона
 
@@ -721,7 +759,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 { "type": "bombs_phase_finished" }
 ```
 
-> Если игрок (или бот) не расставил все 3 бомбы за 20 секунд — недостающие расставляются случайно.
+> Если игрок (или бот) не расставил все `bombCount` бомб за отведённое время — недостающие расставляются случайно.
 
 ---
 
@@ -738,7 +776,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
       "you": 3,
       "opponent": 3
     },
-    "availableCells": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    "availableCells": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],  // 0 .. gridRows*gridCols-1
     "timeLeft": 15
   }
 }
@@ -786,7 +824,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 
 | Поле | Тип | Описание |
 |------|-----|----------|
-| `cell` | integer | Номер клетки (0-11) на поле ПРОТИВНИКА |
+| `cell` | integer | Номер клетки (0 .. gridRows×gridCols-1) на поле ПРОТИВНИКА |
 
 **SERVER → move_result** (broadcast)
 
@@ -982,6 +1020,16 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
       "active": true
     },
     {
+      "id": 3,
+      "code": "cake",
+      "name": "Тортик",
+      "type": "item_model",
+      "price": 200,
+      "currency": "coins",
+      "owned": false,
+      "active": false
+    },
+    {
       "id": 10,
       "code": "fire_strike",
       "name": "Fire Strike",
@@ -999,6 +1047,8 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 
 | type | Описание |
 |------|----------|
+| `model` | 3D-модель персонажа (спавнится за столом) |
+| `item_model` | 3D-модель предмета на столе (тортик, яблоко, кристалл и т.д.) |
 | `skin` | Скин персонажа |
 | `effect` | Визуальный эффект |
 | `animation_hit` | Анимация попадания |
@@ -1008,7 +1058,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 
 | Поле | Тип | Описание |
 |------|-----|----------|
-| `type` | string | Один из 6 типов выше |
+| `type` | string | Один из 8 типов выше |
 | `owned` | boolean | `true` если куплен или бесплатный |
 | `active` | boolean | `true` если экипирован |
 
@@ -1070,7 +1120,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 ```
 
 > Бесплатные предметы можно экипировать без покупки. Платные — только после покупки.
-> Предмет экипируется в слот, соответствующий его типу (`skin` → слот скина, `animation_hit` → слот анимации попадания и т.д.).
+> Предмет экипируется в слот, соответствующий его типу (`model` → слот модели персонажа, `item_model` → слот предмета на столе, `skin` → слот скина, `animation_hit` → слот анимации попадания и т.д.).
 
 **Ошибки:**
 - `"Item not found"` — предмет не существует
@@ -1205,6 +1255,17 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
     "turn": 5,
     "bombsTimeLeft": 0,
     "moveTimeLeft": 12,
+    "gridRows": 3,
+    "gridCols": 5,
+    "bombCount": 3,
+    "opponent": {
+      "id": 8,
+      "nickname": "Player2",
+      "model_code": "character_mage",
+      "item_model_code": "cake",
+      "skin_code": "gold_skin",
+      "effect_code": "default_effect"
+    },
     "board": {
       "yourLives": 3,
       "opponentLives": 2,
@@ -1228,7 +1289,22 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 | `turn` | integer | userId текущего ходящего |
 | `bombsTimeLeft` | integer | Оставшееся время фазы бомб |
 | `moveTimeLeft` | integer | Оставшееся время на ход |
+| `gridRows` | integer | Количество строк сетки |
+| `gridCols` | integer | Количество столбцов сетки |
+| `bombCount` | integer | Количество бомб на игрока |
+| `opponent` | object | Данные оппонента (для восстановления моделей) |
 | `board` | object | Полное состояние доски (см. ниже) |
+
+**Поля `opponent`:**
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| `id` | integer | ID оппонента (отрицательный = бот) |
+| `nickname` | string | Никнейм |
+| `model_code` | string | Код модели персонажа |
+| `item_model_code` | string | Код модели предмета на столе |
+| `skin_code` | string | Код скина |
+| `effect_code` | string | Код эффекта |
 
 **Поля `board`:**
 
@@ -1236,7 +1312,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 |------|-----|----------|
 | `yourLives` | integer | Оставшиеся жизни игрока |
 | `opponentLives` | integer | Оставшиеся жизни оппонента |
-| `yourBombs` | integer[] | Позиции бомб игрока (0-11) |
+| `yourBombs` | integer[] | Позиции бомб игрока (0 .. gridRows×gridCols-1) |
 | `yourAttacks` | array | Клетки, атакованные игроком на доске оппонента |
 | `opponentAttacks` | array | Клетки, атакованные оппонентом на доске игрока |
 
@@ -1472,9 +1548,12 @@ ws://host:3000?token=...    ─────────────────�
                                   opponent: {
                                     id: -1,
                                     nickname: "NeonWolf158",
+                                    model_code: "character_bot",
+                                    item_model_code: "default_chip",
                                     skin_code: "default_skin2",
                                     effect_code: "default_effect"
-                                  }
+                                  },
+                                  gridRows: 3, gridCols: 4, bombCount: 3
                                 }
 
 4. ОБРАТНЫЙ ОТСЧЁТ
@@ -1529,8 +1608,8 @@ ws://host:3000?token=...    ─────────────────�
 | `cancel_play` | — | Отменить поиск / выйти до игры |
 | `leave_room` | — | Выйти из комнаты |
 | `get_room_info` | — | Запросить инфо о текущей комнате |
-| `place_bombs` | `bombs` (int[3]) | Расставить 3 бомбы |
-| `make_move` | `cell` (int 0-11) | Сделать ход |
+| `place_bombs` | `bombs` (int[bombCount]) | Расставить бомбы (кол-во из request_bombs) |
+| `make_move` | `cell` (int 0..gridRows×gridCols-1) | Сделать ход |
 | `get_shop_items` | — | Список предметов магазина |
 | `buy_item` | `itemId` | Купить предмет |
 | `equip_item` | `itemId` | Экипировать предмет |
@@ -1544,7 +1623,7 @@ ws://host:3000?token=...    ─────────────────�
 | type | Кому | Когда |
 |------|------|-------|
 | `authSuccess` | отправителю | при подключении |
-| `user_customization` | отправителю | при подключении (6 слотов) |
+| `user_customization` | отправителю | при подключении (8 слотов: model, item_model, skin, effect, 4 анимации) |
 | `user_stats` | отправителю | по запросу |
 | `arenas_list` | отправителю | по запросу |
 | `arena_queue_update` | broadcast (свободные) | изменение очереди на арене |
@@ -1554,14 +1633,14 @@ ws://host:3000?token=...    ─────────────────�
 | `room_updated` | отправителю | комната обновлена (напр. стала приватной) |
 | `invite_sent` | отправителю | инвайт другу отправлен |
 | `searching_opponent` | отправителю | начат публичный поиск оппонента |
-| `opponent_joined` | обоим | оппонент подключился (реальный или бот) |
+| `opponent_joined` | обоим | оппонент подключился (с model_code, item_model_code, gridRows, gridCols, bombCount) |
 | `balance_update` | отправителю | баланс обновлён (при accept_invite) |
 | `play_cancelled` | отправителю | поиск отменён, ставка возвращена (с newBalance) |
 | `room_info` | broadcast (комната) | при запросе get_room_info |
 | `game_countdown` | broadcast (комната) | обратный отсчёт (5 сек) |
 | `countdown_cancelled` | broadcast (комната) | отсчёт отменён (оппонент ушёл) |
 | `game_started` | broadcast (комната) | игра началась |
-| `request_bombs` | broadcast (комната) | запрос на расстановку бомб |
+| `request_bombs` | broadcast (комната) | запрос на расстановку бомб (с gridRows, gridCols, bombCount, timeLeft) |
 | `bombs_phase_update` | broadcast (комната) | таймер фазы бомб |
 | `bombs_placed` | broadcast (комната) | оба расставили бомбы |
 | `bombs_phase_finished` | broadcast (комната) | фаза бомб окончена |
@@ -1571,7 +1650,7 @@ ws://host:3000?token=...    ─────────────────�
 | `move_result` | broadcast (комната) | результат хода (с анимациями) |
 | `game_finished` | broadcast (комната) | игра окончена (с анимациями) |
 | `left_room` | отправителю | вышел из комнаты (с newBalance) |
-| `shop_items` | отправителю | список предметов (6 типов) |
+| `shop_items` | отправителю | список предметов (8 типов: model, item_model, skin, effect, 4 анимации) |
 | `purchase_success` | отправителю | покупка успешна (с newBalance) |
 | `equip_success` | отправителю | экипировка успешна |
 | `friends_list` | отправителю | список друзей |
@@ -1581,5 +1660,5 @@ ws://host:3000?token=...    ─────────────────�
 | `friend_request_accepted` | отправителю заявки | заявка принята |
 | `game_invite_received` | приглашённому | приглашение в комнату |
 | `reconnect_ok` | отправителю | результат реконнекта |
-| `game_state_restore` | отправителю | восстановление состояния игры (с board) |
+| `game_state_restore` | отправителю | восстановление состояния игры (с grid, opponent, board) |
 | `error` | отправителю | ошибка |
