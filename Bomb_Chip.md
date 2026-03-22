@@ -12,13 +12,14 @@
 4. [Арены (локации)](#4-арены-локации)
 5. [Матчмейкинг](#5-матчмейкинг)
 6. [Игровой процесс](#6-игровой-процесс)
-7. [Магазин и кастомизация](#7-магазин-и-кастомизация)
-8. [Друзья и инвайты](#8-друзья-и-инвайты)
-9. [Реконнект](#9-реконнект)
-10. [Ошибки](#10-ошибки)
-11. [Полный игровой цикл — Публичная игра](#11-полный-игровой-цикл--публичная-игра)
-12. [Полный игровой цикл — Игра с другом](#12-полный-игровой-цикл--игра-с-другом)
-13. [Полный игровой цикл — Игра с ботом](#13-полный-игровой-цикл--игра-с-ботом)
+7. [Реиграбельность (Rematch)](#7-реиграбельность-rematch)
+8. [Магазин и кастомизация](#8-магазин-и-кастомизация)
+9. [Друзья и инвайты](#9-друзья-и-инвайты)
+10. [Реконнект](#10-реконнект)
+11. [Ошибки](#11-ошибки)
+12. [Полный игровой цикл — Публичная игра](#12-полный-игровой-цикл--публичная-игра)
+13. [Полный игровой цикл — Игра с другом](#13-полный-игровой-цикл--игра-с-другом)
+14. [Полный игровой цикл — Игра с ботом](#14-полный-игровой-цикл--игра-с-ботом)
 
 ---
 
@@ -570,6 +571,7 @@ ws://<host>:3000?token=<JWT_TOKEN>
 | **invite_window / searching / private_waiting** | Ставка возвращается. Комната удаляется. |
 | **matched (countdown)** | Ставка уходящему возвращается. Countdown отменяется. Оставшийся игрок получает `countdown_cancelled` и переходит обратно в поиск. Если оппонент был бот — комната удаляется. |
 | **playing** | Противник автоматически побеждает и получает `bet × 2`. Противнику приходит `game_finished` с `reason: "opponent_left"`. Против бота — игрок проигрывает. |
+| **rematch_countdown** | Ставка возвращается **обоим**. Countdown отменяется. Уходящий получает `left_room`. Оставшийся получает `rematch_cancelled` и отправляется в меню. Комната удаляется. |
 
 **Ошибки:**
 - `"You are not in a room"`
@@ -637,7 +639,7 @@ ws://<host>:3000?token=<JWT_TOKEN>
 }
 ```
 
-> `status` — одно из: `"invite_window"`, `"private_waiting"`, `"searching"`, `"matched"`, `"playing"`
+> `status` — одно из: `"invite_window"`, `"private_waiting"`, `"searching"`, `"matched"`, `"playing"`, `"rematch_countdown"`
 > `player2` — `null` если в комнате один игрок. Поле `isBot: true` если оппонент — бот.
 > Нет понятия «хост» — оба игрока равны.
 
@@ -655,6 +657,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 → searching_opponent → opponent_joined → game_countdown → game_started
 → request_bombs → place_bombs (оба) → bombs_phase_finished
 → request_move / opponent_move → make_move → move_result → ... → game_finished
+→ rematch_countdown_start → game_countdown (5 сек) → game_started → ... (новая игра)
 ```
 
 ### 6.1 Обратный отсчёт
@@ -992,12 +995,154 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 ```
 
 > `prize` = `bet × 2`. Выигрыш начисляется на баланс победителя автоматически. При `reason: "opponent_left"` анимации не отправляются.
+> После `game_finished` автоматически запускается [Реиграбельность (Rematch)](#7-реиграбельность-rematch), если игра завершилась в обычном порядке (не по дисконнекту).
 
 ---
 
-## 7. Магазин и кастомизация
+## 7. Реиграбельность (Rematch)
 
-### 7.1 Получить список предметов
+### Концепция
+
+После завершения игры (`game_finished`) комната **не удаляется**. Вместо этого автоматически запускается обратный отсчёт рематча — аналогично `game_countdown` при первом старте. Оба игрока остаются в комнате и могут выйти во время countdown. Если оба остались — новая игра стартует автоматически с той же ставкой на той же арене.
+
+**Ключевые принципы:**
+- Рематч запускается автоматически после любого завершения игры (победа по очкам, включая игры с ботом)
+- При завершении по дисконнекту — рематч **не** запускается (игрок уже отключён)
+- При завершении по `leave_room` во время игры — рематч **не** запускается (игрок ушёл сам, `game_finished` с `reason: "opponent_left"`)
+- Ставка списывается заново с обоих игроков перед countdown
+- Если у кого-то не хватает баланса — оба отправляются в меню
+- Во время countdown любой игрок может выйти (`leave_room`) — ставка возвращается **обоим**, оба в меню
+
+### 7.1 Начало rematch countdown
+
+Сразу после `game_finished` сервер проверяет балансы обоих игроков. Если хватает — списывает ставки и запускает countdown.
+
+**SERVER → rematch_countdown_start** (обоим)
+```json
+{
+  "type": "rematch_countdown_start",
+  "payload": {
+    "seconds": 5,
+    "bet": 50,
+    "newBalance": 950
+  }
+}
+```
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| `seconds` | integer | Длительность countdown (5 секунд) |
+| `bet` | integer | Ставка (та же, что была в комнате) |
+| `newBalance` | integer | Баланс после списания ставки |
+
+> Ставка списывается **сразу** при старте rematch countdown (аналогично `play`). Возвращается при выходе.
+
+Сразу после `rematch_countdown_start` начинается обратный отсчёт:
+
+**SERVER → game_countdown** (broadcast, каждую секунду)
+```json
+{
+  "type": "game_countdown",
+  "payload": { "timeLeft": 5 }
+}
+```
+
+> `timeLeft` уменьшается: 5, 4, 3, 2, 1, 0. При 0 — запускается новая игра (`game_started`).
+> Используется тот же тип сообщения `game_countdown`, что и при первом старте — клиент может обрабатывать одинаково.
+
+---
+
+### 7.2 Рематч невозможен (не хватает баланса)
+
+Если у одного или обоих игроков не хватает баланса на повторную ставку:
+
+**SERVER → rematch_failed** (обоим)
+```json
+{
+  "type": "rematch_failed",
+  "payload": {
+    "reason": "not_enough_balance",
+    "balance": 30
+  }
+}
+```
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| `reason` | string | Причина (см. ниже) |
+| `balance` | integer | Текущий баланс игрока |
+
+**Значения `reason`:**
+
+| reason | Описание |
+|--------|----------|
+| `"not_enough_balance"` | У вас не хватает баланса |
+| `"opponent_not_enough_balance"` | У оппонента не хватает баланса |
+
+> После `rematch_failed` оба игрока отправляются в меню. Комната удаляется. `roomId` очищается.
+
+---
+
+### 7.3 Выход во время rematch countdown
+
+Любой игрок может выйти из комнаты во время rematch countdown через `leave_room`.
+
+**CLIENT →**
+```json
+{ "type": "leave_room" }
+```
+
+**SERVER → left_room** (уходящему)
+```json
+{
+  "type": "left_room",
+  "payload": { "newBalance": 1000 }
+}
+```
+
+**SERVER → rematch_cancelled** (оставшемуся)
+```json
+{
+  "type": "rematch_cancelled",
+  "payload": {
+    "reason": "opponent_left",
+    "newBalance": 1000
+  }
+}
+```
+
+> Ставка возвращается **обоим** игрокам. Оба отправляются в меню. Комната удаляется.
+> `cancel_play` **не работает** во время rematch countdown — используйте `leave_room`.
+
+---
+
+### 7.4 Disconnect во время rematch countdown
+
+При дисконнекте одного из игроков во время rematch countdown:
+- Ставка возвращается обоим
+- Оставшийся получает `rematch_cancelled` с `reason: "opponent_left"` и отправляется в меню
+- Комната удаляется
+
+> Поведение аналогично `leave_room` во время rematch countdown.
+
+---
+
+### 7.5 После countdown — новая игра
+
+Если оба игрока остались в комнате до конца countdown (`timeLeft: 0`), автоматически запускается новая игра:
+
+1. `game_started` — аналогично первому старту
+2. `request_bombs` — новая фаза расстановки бомб
+3. Далее — стандартный игровой процесс (фаза ходов, `move_result`, `game_finished`)
+4. После следующего `game_finished` — снова rematch countdown
+
+> Цикл повторяется бесконечно, пока оба игрока остаются в комнате и имеют достаточный баланс.
+
+---
+
+## 8. Магазин и кастомизация
+
+### 8.1 Получить список предметов
 
 **CLIENT →**
 ```json
@@ -1075,7 +1220,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 
 ---
 
-### 7.2 Купить предмет
+### 8.2 Купить предмет
 
 **CLIENT →**
 ```json
@@ -1101,7 +1246,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 
 ---
 
-### 7.3 Экипировать предмет
+### 8.3 Экипировать предмет
 
 **CLIENT →**
 ```json
@@ -1129,9 +1274,9 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 
 ---
 
-## 8. Друзья и инвайты
+## 9. Друзья и инвайты
 
-### 8.1 Список друзей
+### 9.1 Список друзей
 
 **CLIENT →**
 ```json
@@ -1151,7 +1296,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 
 ---
 
-### 8.2 Отправить заявку в друзья
+### 9.2 Отправить заявку в друзья
 
 **CLIENT →**
 ```json
@@ -1187,7 +1332,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 
 ---
 
-### 8.3 Принять заявку в друзья
+### 9.3 Принять заявку в друзья
 
 **CLIENT →**
 ```json
@@ -1213,7 +1358,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 
 ---
 
-## 9. Реконнект
+## 10. Реконнект
 
 При повторном подключении клиент может восстановить состояние:
 
@@ -1242,7 +1387,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 }
 ```
 
-> `status` — текущий статус комнаты: `"invite_window"`, `"private_waiting"`, `"searching"`, `"matched"`, `"playing"`.
+> `status` — текущий статус комнаты: `"invite_window"`, `"private_waiting"`, `"searching"`, `"matched"`, `"playing"`, `"rematch_countdown"`.
 
 Если игра активна, дополнительно приходит:
 
@@ -1324,7 +1469,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 
 ---
 
-## 10. Ошибки
+## 11. Ошибки
 
 Все ошибки приходят в формате:
 ```json
@@ -1362,7 +1507,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 
 ---
 
-## 11. Полный игровой цикл — Публичная игра
+## 12. Полный игровой цикл — Публичная игра
 
 Пошаговая последовательность сообщений для одной полной партии:
 
@@ -1468,11 +1613,38 @@ ws://host:3000?token=...    ─────────────────�
                                   arenaId:1, arenaCode:"backyard",
                                   animations: [...]
                                 } (A+B)
+
+13. REMATCH COUNTDOWN (автоматически после game_finished)
+                            ──> rematch_countdown_start {
+                                  seconds:5, bet:50, newBalance:...
+                                } (A+B)
+                            ──> game_countdown {timeLeft:5} (A+B)
+                            ...
+                            ──> game_countdown {timeLeft:0} (A+B)
+
+14. НОВАЯ ИГРА (если оба остались)
+                            ──> game_started (A+B)
+                            ──> request_bombs (A+B)
+                            ... (повторяется с шага 10) ...
+
+    ИЛИ: ВЫХОД ВО ВРЕМЯ COUNTDOWN
+{type:"leave_room"}         ──────────────────────>
+                            <── left_room {newBalance:1000}
+                            ──> rematch_cancelled (B) {
+                                  reason:"opponent_left",
+                                  newBalance:1000
+                                }
+
+    ИЛИ: НЕ ХВАТАЕТ БАЛАНСА
+                            ──> rematch_failed {
+                                  reason:"not_enough_balance",
+                                  balance:30
+                                } (A и/или B)
 ```
 
 ---
 
-## 12. Полный игровой цикл — Игра с другом
+## 13. Полный игровой цикл — Игра с другом
 
 Пошаговая последовательность для приватной игры с приглашением друга:
 
@@ -1512,7 +1684,7 @@ ws://host:3000?token=...    ─────────────────�
                             ...
                             ──> game_countdown {timeLeft:0} (A+B)
 
-7. СТАРТ + БОМБЫ + ХОДЫ — аналогично публичной игре (раздел 11)
+7. СТАРТ + БОМБЫ + ХОДЫ — аналогично публичной игре (раздел 12)
 
 8. КОНЕЦ ИГРЫ
                             ──> game_finished {
@@ -1520,11 +1692,13 @@ ws://host:3000?token=...    ─────────────────�
                                   arenaId:1, arenaCode:"backyard",
                                   animations: [...]
                                 } (A+B)
+
+9. REMATCH — аналогично публичной игре (раздел 12, шаги 13-14)
 ```
 
 ---
 
-## 13. Полный игровой цикл — Игра с ботом
+## 14. Полный игровой цикл — Игра с ботом
 
 Если оппонент не найден — подключается бот через 5 секунд:
 
@@ -1589,6 +1763,23 @@ ws://host:3000?token=...    ─────────────────�
                                   arenaId:1, arenaCode:"backyard",
                                   animations: [...]
                                 }
+
+9. REMATCH COUNTDOWN (автоматически)
+                            <── rematch_countdown_start {
+                                  seconds:5, bet:50, newBalance:...
+                                }
+                            <── game_countdown {timeLeft:5}
+                            ...
+                            <── game_countdown {timeLeft:0}
+
+10. НОВАЯ ИГРА (если игрок остался и хватает баланса)
+                            <── game_started
+                            <── request_bombs
+                            ... (повторяется с шага 5) ...
+
+    ИЛИ: ВЫХОД ВО ВРЕМЯ COUNTDOWN
+{type:"leave_room"}         ──────────────────────>
+                            <── left_room {newBalance:1000}
 ```
 
 ---
@@ -1649,6 +1840,9 @@ ws://host:3000?token=...    ─────────────────�
 | `move_timer_update` | broadcast (комната) | таймер хода |
 | `move_result` | broadcast (комната) | результат хода (с анимациями) |
 | `game_finished` | broadcast (комната) | игра окончена (с анимациями) |
+| `rematch_countdown_start` | broadcast (комната) | начало countdown рематча (с seconds, bet, newBalance) |
+| `rematch_failed` | broadcast (комната) | рематч невозможен — не хватает баланса (с reason, balance) |
+| `rematch_cancelled` | оставшемуся | оппонент вышел во время rematch countdown (с reason, newBalance) |
 | `left_room` | отправителю | вышел из комнаты (с newBalance) |
 | `shop_items` | отправителю | список предметов (8 типов: model, item_model, skin, effect, 4 анимации) |
 | `purchase_success` | отправителю | покупка успешна (с newBalance) |

@@ -18,7 +18,7 @@ const DEFAULT_BOMB_COUNT = 3;
 
 // ===== Новая Matchmaking система =====
 // roomState: roomId -> { status, arenaId, bet, player1Id, player1Ws, isPrivate, inviteTimer, botTimer, gridRows, gridCols, bombCount }
-// status: 'invite_window' | 'private_waiting' | 'searching' | 'matched' | 'playing'
+// status: 'invite_window' | 'private_waiting' | 'searching' | 'matched' | 'playing' | 'rematch_countdown'
 const roomState = new Map();
 
 // waitingRooms: key(`${arenaId}_${bet}`) -> Array<roomId>
@@ -294,7 +294,7 @@ function findWsByUserId(userId) {
   return null;
 }
 
-async function finishGame(roomId, winnerId) {
+async function finishGame(roomId, winnerId, { skipRematch = false } = {}) {
   const game = activeGames.get(roomId);
   if (!game) return;
 
@@ -302,6 +302,8 @@ async function finishGame(roomId, winnerId) {
 
   const bot = activeBots.get(roomId);
   const client = await pool.connect();
+
+  let room = null;
 
   try {
     await client.query("BEGIN");
@@ -316,7 +318,7 @@ async function finishGame(roomId, winnerId) {
       return;
     }
 
-    const room = roomResult.rows[0];
+    room = roomResult.rows[0];
     const totalPrize = room.bet * 2;
 
     const playerIds = Object.keys(game.players).map(Number);
@@ -331,11 +333,6 @@ async function finishGame(roomId, winnerId) {
       );
       winnerNewBalance = balResult.rows[0].balance;
     }
-
-    await client.query(
-      "DELETE FROM rooms WHERE id = $1",
-      [roomId]
-    );
 
     await client.query("COMMIT");
 
@@ -353,7 +350,7 @@ async function finishGame(roomId, winnerId) {
       payload.arenaCode = room.arena_code;
     }
 
-    // Send newBalance individually to winner and clear roomId
+    // Send game_finished to both players (НЕ очищаем roomId — будет rematch countdown)
     wss.clients.forEach(c => {
       if (c.roomId !== roomId || !c.user) return;
       const msg = { type: "game_finished", payload: { ...payload } };
@@ -361,19 +358,191 @@ async function finishGame(roomId, winnerId) {
         msg.payload.newBalance = winnerNewBalance;
       }
       c.send(JSON.stringify(msg));
-      c.roomId = null;
     });
 
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("finishGame error:", err);
+    return;
   } finally {
     client.release();
   }
 
-  // Cleanup bot
-  if (bot) activeBots.delete(roomId);
-  roomState.delete(roomId);
+  // Очищаем game engine но НЕ roomState
+  cleanupGame(roomId);
+
+  if (skipRematch) {
+    // Очищаем всё без рематча
+    await pool.query("DELETE FROM rooms WHERE id = $1", [roomId]).catch(() => {});
+    if (bot) activeBots.delete(roomId);
+    roomState.delete(roomId);
+    wss.clients.forEach(c => {
+      if (c.roomId === roomId) c.roomId = null;
+    });
+    return;
+  }
+
+  // Запускаем rematch countdown
+  await startRematchCountdown(roomId, room, bot);
+}
+
+// ===== Rematch Countdown =====
+async function startRematchCountdown(roomId, room, bot) {
+  const state = roomState.get(roomId);
+  if (!state) {
+    // Нет state — просто очищаем
+    await pool.query("DELETE FROM rooms WHERE id = $1", [roomId]);
+    if (bot) activeBots.delete(roomId);
+    wss.clients.forEach(c => {
+      if (c.roomId === roomId) c.roomId = null;
+    });
+    return;
+  }
+
+  const bet = room.bet;
+  const dbClient = await pool.connect();
+
+  try {
+    await dbClient.query("BEGIN");
+
+    // Собираем реальных игроков в комнате
+    const realPlayerIds = [];
+    wss.clients.forEach(c => {
+      if (c.roomId === roomId && c.user && c.readyState === 1) {
+        realPlayerIds.push(c.user.id);
+      }
+    });
+
+    // Проверяем баланс всех реальных игроков
+    const balanceChecks = {};
+    for (const playerId of realPlayerIds) {
+      const balResult = await dbClient.query(
+        "SELECT balance FROM users WHERE id = $1 FOR UPDATE",
+        [playerId]
+      );
+      if (balResult.rows.length > 0) {
+        balanceChecks[playerId] = balResult.rows[0].balance;
+      }
+    }
+
+    // Проверяем хватает ли баланса всем
+    const cantAfford = realPlayerIds.filter(id => (balanceChecks[id] || 0) < bet);
+
+    if (cantAfford.length > 0) {
+      await dbClient.query("ROLLBACK");
+
+      // Кто не может — отправляем rematch_failed, всех в меню
+      await pool.query("DELETE FROM rooms WHERE id = $1", [roomId]);
+      if (bot) activeBots.delete(roomId);
+      cleanupRoomState(roomId);
+
+      wss.clients.forEach(c => {
+        if (c.roomId === roomId && c.user && c.readyState === 1) {
+          const reason = cantAfford.includes(c.user.id)
+            ? "not_enough_balance"
+            : "opponent_not_enough_balance";
+          c.send(JSON.stringify({
+            type: "rematch_failed",
+            payload: { reason, balance: balanceChecks[c.user.id] || 0 }
+          }));
+          c.roomId = null;
+        }
+      });
+      return;
+    }
+
+    // Списываем ставки со всех реальных игроков
+    const newBalances = {};
+    for (const playerId of realPlayerIds) {
+      if (bet > 0) {
+        const balResult = await dbClient.query(
+          "UPDATE users SET balance = balance - $1 WHERE id = $2 RETURNING balance",
+          [bet, playerId]
+        );
+        newBalances[playerId] = balResult.rows[0].balance;
+      } else {
+        newBalances[playerId] = balanceChecks[playerId];
+      }
+    }
+
+    // Обновляем статус комнаты в БД
+    await dbClient.query(
+      "UPDATE rooms SET status = 'rematch_countdown' WHERE id = $1",
+      [roomId]
+    );
+
+    await dbClient.query("COMMIT");
+
+    // Обновляем state
+    state.status = "rematch_countdown";
+
+    // Отправляем rematch_countdown_start с новыми балансами
+    wss.clients.forEach(c => {
+      if (c.roomId === roomId && c.user && c.readyState === 1) {
+        c.send(JSON.stringify({
+          type: "rematch_countdown_start",
+          payload: {
+            seconds: 5,
+            bet,
+            newBalance: newBalances[c.user.id] ?? null
+          }
+        }));
+      }
+    });
+
+    // Запускаем обратный отсчёт (как game_countdown)
+    let timeLeft = 5;
+
+    broadcast(roomId, {
+      type: "game_countdown",
+      payload: { timeLeft }
+    });
+
+    const interval = setInterval(async () => {
+      timeLeft--;
+
+      broadcast(roomId, {
+        type: "game_countdown",
+        payload: { timeLeft }
+      });
+
+      if (timeLeft <= 0) {
+        clearInterval(interval);
+        roomCountdowns.delete(roomId);
+
+        // Обновляем статус на matched перед launchGame
+        const currentState = roomState.get(roomId);
+        if (currentState && currentState.status === "rematch_countdown") {
+          currentState.status = "matched";
+          await pool.query(
+            "UPDATE rooms SET status = 'matched' WHERE id = $1",
+            [roomId]
+          );
+          try {
+            await launchGame(roomId);
+          } catch (err) {
+            console.error("rematch launchGame error for room", roomId, err);
+          }
+        }
+      }
+    }, 1000);
+
+    roomCountdowns.set(roomId, interval);
+
+  } catch (err) {
+    await dbClient.query("ROLLBACK");
+    console.error("startRematchCountdown error:", err);
+
+    // Fallback — очищаем всё
+    await pool.query("DELETE FROM rooms WHERE id = $1", [roomId]).catch(() => {});
+    if (bot) activeBots.delete(roomId);
+    cleanupRoomState(roomId);
+    wss.clients.forEach(c => {
+      if (c.roomId === roomId) c.roomId = null;
+    });
+  } finally {
+    dbClient.release();
+  }
 }
 
 function cleanupGame(roomId) {
@@ -1638,8 +1807,8 @@ wss.on("connection", async (ws, req) => {
           return ws.send(JSON.stringify({ type: "error", message: "No room state" }));
         }
 
-        // Нельзя отменить во время игры
-        if (state.status === "playing") {
+        // Нельзя отменить во время игры или rematch countdown (используйте leave_room)
+        if (state.status === "playing" || state.status === "rematch_countdown") {
           return ws.send(JSON.stringify({ type: "error", message: "Game already started" }));
         }
 
@@ -1694,6 +1863,67 @@ wss.on("connection", async (ws, req) => {
 
           const room = roomResult.rows[0];
           const bot = activeBots.get(roomId);
+
+          // ===== ВО ВРЕМЯ REMATCH COUNTDOWN =====
+          if (state?.status === "rematch_countdown") {
+            // Отменяем countdown
+            if (roomCountdowns.has(roomId)) {
+              clearInterval(roomCountdowns.get(roomId));
+              roomCountdowns.delete(roomId);
+            }
+
+            // Рефанд ставки всем реальным игрокам (ставка уже списана при старте rematch countdown)
+            const rematchBet = room.bet;
+
+            // Рефанд уходящему
+            let leaverBalance = null;
+            if (rematchBet > 0) {
+              const balResult = await pool.query(
+                "UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING balance",
+                [rematchBet, ws.user.id]
+              );
+              leaverBalance = balResult.rows[0].balance;
+            } else {
+              const balResult = await pool.query("SELECT balance FROM users WHERE id = $1", [ws.user.id]);
+              leaverBalance = balResult.rows[0].balance;
+            }
+
+            // Рефанд оставшемуся реальному оппоненту
+            const remainingId = room.host_id === ws.user.id ? room.guest_id : room.host_id;
+            if (remainingId && !bot) {
+              let remainingBalance = null;
+              if (rematchBet > 0) {
+                const balResult = await pool.query(
+                  "UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING balance",
+                  [rematchBet, remainingId]
+                );
+                remainingBalance = balResult.rows[0].balance;
+              } else {
+                const balResult = await pool.query("SELECT balance FROM users WHERE id = $1", [remainingId]);
+                remainingBalance = balResult.rows[0].balance;
+              }
+
+              // Уведомляем оставшегося — отправляем в меню
+              const remainingWs = findWsByUserId(remainingId);
+              if (remainingWs && remainingWs.readyState === 1) {
+                remainingWs.send(JSON.stringify({
+                  type: "rematch_cancelled",
+                  payload: { reason: "opponent_left", newBalance: remainingBalance }
+                }));
+                remainingWs.roomId = null;
+              }
+            }
+
+            // Удаляем комнату и очищаем
+            await pool.query("DELETE FROM rooms WHERE id = $1", [roomId]);
+            fullRoomCleanup(roomId);
+            ws.roomId = null;
+
+            return ws.send(JSON.stringify({
+              type: "left_room",
+              payload: { newBalance: leaverBalance }
+            }));
+          }
 
           // ===== ВО ВРЕМЯ ИГРЫ =====
           if (state?.status === "playing" || room.status === "playing") {
@@ -2395,6 +2625,69 @@ wss.on("connection", async (ws, req) => {
       return;
     }
 
+    // ===== Дисконнект во время rematch_countdown =====
+    if (state?.status === "rematch_countdown") {
+      try {
+        // Отменяем countdown
+        if (roomCountdowns.has(roomId)) {
+          clearInterval(roomCountdowns.get(roomId));
+          roomCountdowns.delete(roomId);
+        }
+
+        const roomResult = await pool.query("SELECT * FROM rooms WHERE id = $1", [roomId]);
+        if (roomResult.rows.length === 0) {
+          fullRoomCleanup(roomId);
+          return;
+        }
+
+        const room = roomResult.rows[0];
+        const bot = activeBots.get(roomId);
+
+        // Рефанд отключившемуся
+        if (room.bet > 0) {
+          await pool.query(
+            "UPDATE users SET balance = balance + $1 WHERE id = $2",
+            [room.bet, ws.user.id]
+          );
+        }
+
+        // Рефанд оставшемуся реальному оппоненту и отправляем в меню
+        const remainingId = room.host_id === ws.user.id ? room.guest_id : room.host_id;
+        if (remainingId && !bot) {
+          if (room.bet > 0) {
+            const balResult = await pool.query(
+              "UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING balance",
+              [room.bet, remainingId]
+            );
+            const remainingWs = findWsByUserId(remainingId);
+            if (remainingWs && remainingWs.readyState === 1) {
+              remainingWs.send(JSON.stringify({
+                type: "rematch_cancelled",
+                payload: { reason: "opponent_left", newBalance: balResult.rows[0].balance }
+              }));
+              remainingWs.roomId = null;
+            }
+          } else {
+            const remainingWs = findWsByUserId(remainingId);
+            if (remainingWs && remainingWs.readyState === 1) {
+              const balResult = await pool.query("SELECT balance FROM users WHERE id = $1", [remainingId]);
+              remainingWs.send(JSON.stringify({
+                type: "rematch_cancelled",
+                payload: { reason: "opponent_left", newBalance: balResult.rows[0].balance }
+              }));
+              remainingWs.roomId = null;
+            }
+          }
+        }
+
+        await pool.query("DELETE FROM rooms WHERE id = $1", [roomId]);
+        fullRoomCleanup(roomId);
+      } catch (err) {
+        console.error("disconnect during rematch_countdown error:", err);
+      }
+      return;
+    }
+
     // ===== Дисконнект из АКТИВНОЙ ИГРЫ =====
     const game = activeGames.get(roomId);
 
@@ -2442,7 +2735,7 @@ wss.on("connection", async (ws, req) => {
 
     // Если играем против бота — мгновенный проигрыш
     if (bot) {
-      await finishGame(roomId, bot.id);
+      await finishGame(roomId, bot.id, { skipRematch: true });
       cleanupGame(roomId);
       return;
     }
@@ -2461,7 +2754,7 @@ wss.on("connection", async (ws, req) => {
           .map(Number)
           .find(id => id !== ws.user.id);
 
-        await finishGame(roomId, opponentId);
+        await finishGame(roomId, opponentId, { skipRematch: true });
         cleanupGame(roomId);
       }
     }, 30000);
