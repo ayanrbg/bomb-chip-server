@@ -302,6 +302,13 @@ async function finishGame(roomId, winnerId, { skipRematch = false } = {}) {
     return;
   }
 
+  // Защита от двойного вызова
+  if (game.finishing) {
+    console.log("[finishGame] already finishing room", roomId, "— skipping");
+    return;
+  }
+  game.finishing = true;
+
   game.phase = "finished";
 
   const bot = activeBots.get(roomId);
@@ -2754,6 +2761,12 @@ wss.on("connection", async (ws, req) => {
       } catch (err) {
         console.error("disconnect handler error:", err);
       }
+      return;
+    }
+
+    // Если игра уже завершается/завершена — не трогаем
+    if (game.phase === "finished" || game.finishing) {
+      console.log("[disconnect] game already finished/finishing for room", roomId, "— ignoring");
       return;
     }
 
