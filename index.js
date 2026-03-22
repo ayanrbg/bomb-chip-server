@@ -295,8 +295,12 @@ function findWsByUserId(userId) {
 }
 
 async function finishGame(roomId, winnerId, { skipRematch = false } = {}) {
+  console.log("[finishGame] called for room", roomId, "winner:", winnerId, "skipRematch:", skipRematch);
   const game = activeGames.get(roomId);
-  if (!game) return;
+  if (!game) {
+    console.log("[finishGame] no game found for room", roomId);
+    return;
+  }
 
   game.phase = "finished";
 
@@ -316,6 +320,7 @@ async function finishGame(roomId, winnerId, { skipRematch = false } = {}) {
     );
 
     if (roomResult.rows.length === 0) {
+      console.log("[finishGame] room not found in DB for room", roomId);
       await client.query("ROLLBACK");
       return;
     }
@@ -353,12 +358,13 @@ async function finishGame(roomId, winnerId, { skipRematch = false } = {}) {
 
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("finishGame error:", err);
+    console.error("[finishGame] DB error:", err);
     return;
   } finally {
     client.release();
   }
 
+  console.log("[finishGame] sending game_finished to clients, finishPayload:", JSON.stringify(finishPayload));
   // Send game_finished ПОСЛЕ завершения транзакции — ошибка send не блокирует rematch
   wss.clients.forEach(c => {
     if (c.roomId !== roomId || !c.user || c.readyState !== 1) return;
@@ -671,7 +677,12 @@ async function autoMove(roomId) {
     });
 
     if (result.winner) {
-      await finishGame(roomId, result.winner);
+      console.log("[autoMove] winner detected:", result.winner, "room:", roomId);
+      try {
+        await finishGame(roomId, result.winner);
+      } catch (err) {
+        console.error("[autoMove] finishGame threw:", err);
+      }
     } else {
       startMoveTimer(roomId);
     }
@@ -866,7 +877,12 @@ function scheduleBotMove(roomId) {
       });
 
       if (result.winner) {
-        await finishGame(roomId, result.winner);
+        console.log("[botMove] winner detected:", result.winner, "room:", roomId);
+        try {
+          await finishGame(roomId, result.winner);
+        } catch (err) {
+          console.error("[botMove] finishGame threw:", err);
+        }
       } else {
         clearInterval(game.moveTimer);
         game.moveTimer = null;
@@ -2183,7 +2199,12 @@ wss.on("connection", async (ws, req) => {
           });
 
           if (result.winner) {
-            await finishGame(ws.roomId, result.winner);
+            console.log("[make_move] winner detected:", result.winner, "room:", ws.roomId);
+            try {
+              await finishGame(ws.roomId, result.winner);
+            } catch (err) {
+              console.error("[make_move] finishGame threw:", err);
+            }
             return;
           }
 
