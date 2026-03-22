@@ -304,6 +304,8 @@ async function finishGame(roomId, winnerId, { skipRematch = false } = {}) {
   const client = await pool.connect();
 
   let room = null;
+  let winnerNewBalance = null;
+  let finishPayload = null;
 
   try {
     await client.query("BEGIN");
@@ -325,7 +327,6 @@ async function finishGame(roomId, winnerId, { skipRematch = false } = {}) {
     const loserId = playerIds.find(id => id !== Number(winnerId));
 
     // Только реальный игрок получает приз
-    let winnerNewBalance = null;
     if (!bot || Number(winnerId) !== bot.id) {
       const balResult = await client.query(
         "UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING balance",
@@ -338,7 +339,7 @@ async function finishGame(roomId, winnerId, { skipRematch = false } = {}) {
 
     const animations = game.getFinishAnimations(winnerId, loserId);
 
-    const payload = {
+    finishPayload = {
       winnerId,
       loserId,
       prize: totalPrize,
@@ -346,19 +347,9 @@ async function finishGame(roomId, winnerId, { skipRematch = false } = {}) {
     };
 
     if (room.arena_id) {
-      payload.arenaId = room.arena_id;
-      payload.arenaCode = room.arena_code;
+      finishPayload.arenaId = room.arena_id;
+      finishPayload.arenaCode = room.arena_code;
     }
-
-    // Send game_finished to both players (НЕ очищаем roomId — будет rematch countdown)
-    wss.clients.forEach(c => {
-      if (c.roomId !== roomId || !c.user) return;
-      const msg = { type: "game_finished", payload: { ...payload } };
-      if (c.user.id === Number(winnerId) && winnerNewBalance !== null) {
-        msg.payload.newBalance = winnerNewBalance;
-      }
-      c.send(JSON.stringify(msg));
-    });
 
   } catch (err) {
     await client.query("ROLLBACK");
@@ -367,6 +358,20 @@ async function finishGame(roomId, winnerId, { skipRematch = false } = {}) {
   } finally {
     client.release();
   }
+
+  // Send game_finished ПОСЛЕ завершения транзакции — ошибка send не блокирует rematch
+  wss.clients.forEach(c => {
+    if (c.roomId !== roomId || !c.user || c.readyState !== 1) return;
+    const msg = { type: "game_finished", payload: { ...finishPayload } };
+    if (c.user.id === Number(winnerId) && winnerNewBalance !== null) {
+      msg.payload.newBalance = winnerNewBalance;
+    }
+    try {
+      c.send(JSON.stringify(msg));
+    } catch (sendErr) {
+      console.error("finishGame send error to user", c.user.id, sendErr.message);
+    }
+  });
 
   // Очищаем game engine но НЕ roomState
   cleanupGame(roomId);
@@ -388,8 +393,10 @@ async function finishGame(roomId, winnerId, { skipRematch = false } = {}) {
 
 // ===== Rematch Countdown =====
 async function startRematchCountdown(roomId, room, bot) {
+  console.log("[startRematchCountdown] starting for room", roomId);
   const state = roomState.get(roomId);
   if (!state) {
+    console.log("[startRematchCountdown] no roomState for room", roomId, "— cleaning up");
     // Нет state — просто очищаем
     await pool.query("DELETE FROM rooms WHERE id = $1", [roomId]);
     if (bot) activeBots.delete(roomId);
@@ -412,6 +419,7 @@ async function startRematchCountdown(roomId, room, bot) {
         realPlayerIds.push(c.user.id);
       }
     });
+    console.log("[startRematchCountdown] realPlayerIds:", realPlayerIds, "bet:", bet);
 
     // Проверяем баланс всех реальных игроков
     const balanceChecks = {};
@@ -427,8 +435,10 @@ async function startRematchCountdown(roomId, room, bot) {
 
     // Проверяем хватает ли баланса всем
     const cantAfford = realPlayerIds.filter(id => (balanceChecks[id] || 0) < bet);
+    console.log("[startRematchCountdown] balanceChecks:", balanceChecks, "cantAfford:", cantAfford);
 
     if (cantAfford.length > 0) {
+      console.log("[startRematchCountdown] rematch_failed — not enough balance for:", cantAfford);
       await dbClient.query("ROLLBACK");
 
       // Кто не может — отправляем rematch_failed, всех в меню
@@ -441,10 +451,14 @@ async function startRematchCountdown(roomId, room, bot) {
           const reason = cantAfford.includes(c.user.id)
             ? "not_enough_balance"
             : "opponent_not_enough_balance";
-          c.send(JSON.stringify({
-            type: "rematch_failed",
-            payload: { reason, balance: balanceChecks[c.user.id] || 0 }
-          }));
+          try {
+            c.send(JSON.stringify({
+              type: "rematch_failed",
+              payload: { reason, balance: balanceChecks[c.user.id] || 0 }
+            }));
+          } catch (e) {
+            console.error("rematch_failed send error:", e.message);
+          }
           c.roomId = null;
         }
       });
@@ -512,6 +526,7 @@ async function startRematchCountdown(roomId, room, bot) {
 
         // Обновляем статус на matched перед launchGame
         const currentState = roomState.get(roomId);
+        console.log("[rematch countdown] timeLeft=0, currentState status:", currentState?.status);
         if (currentState && currentState.status === "rematch_countdown") {
           currentState.status = "matched";
           await pool.query(
@@ -657,7 +672,6 @@ async function autoMove(roomId) {
 
     if (result.winner) {
       await finishGame(roomId, result.winner);
-      cleanupGame(roomId);
     } else {
       startMoveTimer(roomId);
     }
@@ -853,7 +867,6 @@ function scheduleBotMove(roomId) {
 
       if (result.winner) {
         await finishGame(roomId, result.winner);
-        cleanupGame(roomId);
       } else {
         clearInterval(game.moveTimer);
         game.moveTimer = null;
@@ -2171,7 +2184,6 @@ wss.on("connection", async (ws, req) => {
 
           if (result.winner) {
             await finishGame(ws.roomId, result.winner);
-            cleanupGame(ws.roomId);
             return;
           }
 
@@ -2736,7 +2748,6 @@ wss.on("connection", async (ws, req) => {
     // Если играем против бота — мгновенный проигрыш
     if (bot) {
       await finishGame(roomId, bot.id, { skipRematch: true });
-      cleanupGame(roomId);
       return;
     }
 
@@ -2755,7 +2766,6 @@ wss.on("connection", async (ws, req) => {
           .find(id => id !== ws.user.id);
 
         await finishGame(roomId, opponentId, { skipRematch: true });
-        cleanupGame(roomId);
       }
     }, 30000);
   });
