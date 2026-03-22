@@ -322,7 +322,7 @@ async function finishGame(roomId, winnerId, { skipRematch = false } = {}) {
     await client.query("BEGIN");
 
     const roomResult = await client.query(
-      "SELECT r.*, a.code as arena_code FROM rooms r LEFT JOIN arenas a ON r.arena_id = a.id WHERE r.id = $1 FOR UPDATE",
+      "SELECT r.*, a.code as arena_code FROM rooms r LEFT JOIN arenas a ON r.arena_id = a.id WHERE r.id = $1 FOR UPDATE OF r",
       [roomId]
     );
 
