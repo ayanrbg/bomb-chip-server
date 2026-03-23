@@ -628,7 +628,7 @@ function startBombsTimer(roomId) {
       return;
     }
 
-    game.bombsTimeLeft = Math.max(0, game.bombsTimeLeft - 2);
+    game.bombsTimeLeft = Math.max(0, game.bombsTimeLeft - 1);
 
     broadcast(roomId, {
       type: "bombs_phase_update",
@@ -640,7 +640,7 @@ function startBombsTimer(roomId) {
       game.bombsTimer = null;
       finishBombsPhase(roomId);
     }
-  }, 2000);
+  }, 1000);
 }
 
 function finishBombsPhase(roomId) {
@@ -736,7 +736,7 @@ function startMoveTimer(roomId) {
       return;
     }
 
-    game.moveTimeLeft = Math.max(0, game.moveTimeLeft - 2);
+    game.moveTimeLeft = Math.max(0, game.moveTimeLeft - 1);
 
     broadcast(roomId, {
       type: "move_timer_update",
@@ -751,7 +751,7 @@ function startMoveTimer(roomId) {
       game.moveTimer = null;
       autoMove(roomId);
     }
-  }, 2000);
+  }, 1000);
 
   sendTurnState(roomId);
 }
