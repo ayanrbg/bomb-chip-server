@@ -752,17 +752,31 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 - `"Bombs must be unique"` — дубликаты
 - `"Invalid cell index"` — число вне диапазона
 
+**SERVER → bombs_accepted** (отправителю, сразу после успешной установки)
+```json
+{
+  "type": "bombs_accepted",
+  "payload": {
+    "bombs": [0, 5, 11]
+  }
+}
+```
+
+> Приходит игроку сразу после того, как сервер принял его бомбы. Содержит массив установленных позиций. Позволяет клиенту подтвердить, что бомбы приняты, не дожидаясь второго игрока.
+
 **SERVER → bombs_placed** (broadcast, когда ОБА расставили бомбы до таймера)
 ```json
 { "type": "bombs_placed" }
 ```
+
+> Если оба игрока расставили бомбы до истечения таймера — таймер сбрасывается и игра начинается сразу, без ожидания оставшегося времени.
 
 **SERVER → bombs_phase_finished** (broadcast, когда таймер истёк ИЛИ оба расставили)
 ```json
 { "type": "bombs_phase_finished" }
 ```
 
-> Если игрок (или бот) не расставил все `bombCount` бомб за отведённое время — недостающие расставляются случайно.
+> Если игрок (или бот) не расставил все `bombCount` бомб за отведённое время — недостающие расставляются случайно сервером.
 
 ---
 
@@ -1563,13 +1577,15 @@ ws://host:3000?token=...    ─────────────────�
 
 {type:"place_bombs",        ──────────────────────>
  bombs:[0,5,11]}
+                            <── bombs_accepted {bombs:[0,5,11]} (A)
 
                             ──> bombs_phase_update {timeLeft:16} (A+B)
 
                                                         {type:"place_bombs",
                             <───────────────────────     bombs:[3,7,9]}
+                            ──> bombs_accepted {bombs:[3,7,9]} (B)
 
-                            ──> bombs_placed (A+B)
+                            ──> bombs_placed (A+B)          ← оба поставили, таймер сброшен
                             ──> bombs_phase_finished (A+B)
 
 11. ФАЗА ХОДОВ (первый ход — случайный)
@@ -1742,8 +1758,9 @@ ws://host:3000?token=...    ─────────────────�
 6. БОМБЫ — бот расставляет с задержкой 2-4 сек
 {type:"place_bombs",        ──────────────────────>
  bombs:[0,5,11]}
+                            <── bombs_accepted {bombs:[0,5,11]}
                             ... (бот ставит бомбы) ...
-                            <── bombs_placed
+                            <── bombs_placed              ← оба поставили, таймер сброшен
                             <── bombs_phase_finished
 
 7. ХОДЫ — бот ходит с задержкой 1-3 сек
@@ -1833,7 +1850,8 @@ ws://host:3000?token=...    ─────────────────�
 | `game_started` | broadcast (комната) | игра началась |
 | `request_bombs` | broadcast (комната) | запрос на расстановку бомб (с gridRows, gridCols, bombCount, timeLeft) |
 | `bombs_phase_update` | broadcast (комната) | таймер фазы бомб |
-| `bombs_placed` | broadcast (комната) | оба расставили бомбы |
+| `bombs_accepted` | отправителю | бомбы приняты сервером (с массивом bombs) |
+| `bombs_placed` | broadcast (комната) | оба расставили бомбы, таймер сброшен |
 | `bombs_phase_finished` | broadcast (комната) | фаза бомб окончена |
 | `request_move` | ходящему | запрос хода |
 | `opponent_move` | ожидающему | оппонент ходит |

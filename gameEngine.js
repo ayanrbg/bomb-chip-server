@@ -176,12 +176,7 @@ export class GameEngine {
     const allPlaced = Object.values(this.players)
       .every(p => p.bombs.length === this.bombCount);
 
-    if (allPlaced) {
-      this.phase = "playing";
-      return { success: true, gameStarted: true };
-    }
-
-    return { success: true };
+    return { success: true, allPlaced };
   }
 
   // =========================

@@ -845,7 +845,7 @@ function scheduleBotBombs(roomId) {
     const bombs = botPlaceBombs(game.bombCount, game.totalCells);
     const result = game.placeBombs(bot.id, bombs);
 
-    if (result.gameStarted) {
+    if (result.allPlaced) {
       clearInterval(game.bombsTimer);
       game.bombsTimer = null;
       broadcast(roomId, { type: "bombs_placed" });
@@ -2165,7 +2165,14 @@ wss.on("connection", async (ws, req) => {
           }));
         }
 
-        if (result.gameStarted) {
+        // Сразу отправляем игроку подтверждение с его бомбами
+        ws.send(JSON.stringify({
+          type: "bombs_accepted",
+          payload: { bombs: data.bombs }
+        }));
+
+        if (result.allPlaced) {
+          // Оба игрока поставили — не ждём таймер, сразу начинаем
           clearInterval(game.bombsTimer);
           game.bombsTimer = null;
           broadcast(ws.roomId, { type: "bombs_placed" });
