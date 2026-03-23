@@ -212,20 +212,21 @@ export class GameEngine {
     opponent.revealed.add(cell);
 
     // ======================
-    // ПОПАЛ В БОМБУ
+    // ПОПАЛ В БОМБУ — подрывается тот, кто тыкнул (атакующий)
     // ======================
     if (opponent.bombs.includes(cell)) {
 
-      opponent.lives--;
+      const attacker = this.players[playerId];
+      attacker.lives--;
 
-      if (opponent.lives <= 0) {
+      if (attacker.lives <= 0) {
         this.phase = "finished";
         return {
           cell,
           bomb: true,
-          explodedPlayer: opponentId,
+          explodedPlayer: playerId,
           livesLeft: 0,
-          winner: playerId,
+          winner: opponentId,
           animations: this.getAnimations(playerId, "hit", opponentId)
         };
       }
@@ -235,8 +236,8 @@ export class GameEngine {
       return {
         cell,
         bomb: true,
-        explodedPlayer: opponentId,
-        livesLeft: opponent.lives,
+        explodedPlayer: playerId,
+        livesLeft: attacker.lives,
         nextTurn: opponentId,
         animations: this.getAnimations(playerId, "hit", opponentId)
       };

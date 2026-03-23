@@ -167,8 +167,8 @@ ws://<host>:3000?token=<JWT_TOKEN>
 {
   "type": "user_customization",
   "payload": {
-    "model_code": "character_warrior",
-    "item_model_code": "default_chip",
+    "model_code": "model_default_1",
+    "item_model_code": "item_default_chip",
     "skin_id": 2,
     "skin_code": "default_skin2",
     "skin_index": "2",
@@ -505,9 +505,9 @@ ws://<host>:3000?token=<JWT_TOKEN>
     "opponent": {
       "id": 8,
       "nickname": "Player2",
-      "model_code": "character_mage",
-      "item_model_code": "cake",
-      "skin_code": "gold_skin",
+      "model_code": "model_premium_3",
+      "item_model_code": "item_premium_2",
+      "skin_code": "default_skin2",
       "effect_code": "default_effect"
     },
     "gridRows": 3,
@@ -534,8 +534,8 @@ ws://<host>:3000?token=<JWT_TOKEN>
 
 **Поведение бота:**
 - Рандомный никнейм из пула (напр. `"CoolBot742"`, `"NeonWolf158"`)
-- Рандомная модель из дефолтных (`model_code`)
-- Рандомный предмет из дефолтных (`item_model_code`)
+- Рандомная модель из дефолтных: `"model_default_1"` или `"model_default_2"`
+- Дефолтный предмет на столе: `"item_default_chip"`
 - Рандомный скин из дефолтных
 - Дефолтные эффекты и анимации
 - Размещает бомбы с задержкой 2-4 секунды
@@ -602,8 +602,8 @@ ws://<host>:3000?token=<JWT_TOKEN>
     "player1": {
       "id": 5,
       "nickname": "Player1",
-      "model_code": "character_warrior",
-      "item_model_code": "default_chip"
+      "model_code": "model_default_1",
+      "item_model_code": "item_default_chip"
     },
     "player2": null
   }
@@ -625,14 +625,14 @@ ws://<host>:3000?token=<JWT_TOKEN>
     "player1": {
       "id": 5,
       "nickname": "Player1",
-      "model_code": "character_warrior",
-      "item_model_code": "default_chip"
+      "model_code": "model_default_1",
+      "item_model_code": "item_default_chip"
     },
     "player2": {
       "id": -1,
       "nickname": "NeonWolf158",
-      "model_code": "character_bot",
-      "item_model_code": "apple",
+      "model_code": "model_default_2",
+      "item_model_code": "item_default_chip",
       "isBot": true
     }
   }
@@ -1163,44 +1163,75 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 { "type": "get_shop_items" }
 ```
 
+Опционально — фильтр по категории:
+```json
+{ "type": "get_shop_items", "category": "model" }
+```
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| `category` | string (опционально) | Фильтр: `"model"`, `"item_model"`, `"skin"`, `"effect"`, `"animation_hit"`, `"animation_miss"`, `"animation_win"`, `"animation_lose"`. Если не передан — все предметы. |
+
 **SERVER → shop_items**
 ```json
 {
   "type": "shop_items",
   "payload": [
     {
-      "id": 1,
-      "code": "default_skin1",
-      "name": "Default Skin 1",
-      "type": "skin",
+      "id": 13,
+      "code": "model_default_1",
+      "name": "Model #1",
+      "type": "model",
       "price": 0,
       "currency": "coins",
       "owned": true,
       "active": true
     },
     {
-      "id": 3,
-      "code": "cake",
-      "name": "Тортик",
-      "type": "item_model",
-      "price": 200,
+      "id": 15,
+      "code": "model_premium_3",
+      "name": "Model #3",
+      "type": "model",
+      "price": 500,
       "currency": "coins",
       "owned": false,
       "active": false
     },
     {
-      "id": 10,
-      "code": "fire_strike",
-      "name": "Fire Strike",
-      "type": "animation_hit",
-      "price": 500,
+      "id": 18,
+      "code": "item_default_chip",
+      "name": "Chip #1",
+      "type": "item_model",
+      "price": 0,
       "currency": "coins",
-      "owned": false,
-      "active": false
+      "owned": true,
+      "active": true
     }
   ]
 }
 ```
+
+### Каталог предметов
+
+**Модели персонажа (type = `model`):**
+
+| code | name | price | Примечание |
+|------|------|-------|------------|
+| `model_default_1` | Model #1 | 0 | Бесплатная (даётся при регистрации случайно) |
+| `model_default_2` | Model #2 | 0 | Бесплатная (даётся при регистрации случайно) |
+| `model_premium_3` | Model #3 | 500 | Покупается в магазине |
+| `model_premium_4` | Model #4 | 800 | Покупается в магазине |
+| `model_premium_5` | Model #5 | 1200 | Покупается в магазине |
+
+**Предметы на столе (type = `item_model`):**
+
+| code | name | price | Примечание |
+|------|------|-------|------------|
+| `item_default_chip` | Chip #1 | 0 | Бесплатная (дефолт) |
+| `item_premium_2` | Chip #2 | 400 | Покупается в магазине |
+| `item_premium_3` | Chip #3 | 700 | Покупается в магазине |
+
+> При регистрации игрок получает случайную модель из двух бесплатных (`model_default_1` или `model_default_2`) и дефолтный предмет (`item_default_chip`). Остальные можно купить в магазине.
 
 ### Типы предметов
 
@@ -1234,7 +1265,41 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 
 ---
 
-### 8.2 Купить предмет
+### 8.2 Получить текущую кастомизацию (для меню)
+
+**CLIENT →**
+```json
+{ "type": "get_my_customization" }
+```
+
+**SERVER → my_customization**
+```json
+{
+  "type": "my_customization",
+  "payload": {
+    "model_id": 13,
+    "model_code": "model_default_1",
+    "model_name": "Model #1",
+    "item_model_id": 18,
+    "item_model_code": "item_default_chip",
+    "item_model_name": "Chip #1",
+    "skin_id": 2,
+    "skin_code": "default_skin2",
+    "effect_id": 5,
+    "effect_code": "default_effect",
+    "animation_hit_code": "default_anim",
+    "animation_miss_code": "default_anim_miss",
+    "animation_win_code": "default_anim_win",
+    "animation_lose_code": "default_anim_lose"
+  }
+}
+```
+
+> Используйте для отрисовки персонажа в меню. Отличие от `user_customization` (при подключении): содержит `model_name`, `item_model_name` и `model_id`, `item_model_id` для удобства UI.
+
+---
+
+### 8.3 Купить предмет
 
 **CLIENT →**
 ```json
@@ -1260,7 +1325,7 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
 
 ---
 
-### 8.3 Экипировать предмет
+### 8.4 Экипировать предмет
 
 **CLIENT →**
 ```json
@@ -1420,9 +1485,9 @@ play → room_created → invite_window_start → (5 сек) → invite_window_e
     "opponent": {
       "id": 8,
       "nickname": "Player2",
-      "model_code": "character_mage",
-      "item_model_code": "cake",
-      "skin_code": "gold_skin",
+      "model_code": "model_premium_3",
+      "item_model_code": "item_premium_2",
+      "skin_code": "default_skin2",
       "effect_code": "default_effect"
     },
     "board": {
@@ -1738,8 +1803,8 @@ ws://host:3000?token=...    ─────────────────�
                                   opponent: {
                                     id: -1,
                                     nickname: "NeonWolf158",
-                                    model_code: "character_bot",
-                                    item_model_code: "default_chip",
+                                    model_code: "model_default_2",
+                                    item_model_code: "item_default_chip",
                                     skin_code: "default_skin2",
                                     effect_code: "default_effect"
                                   },
@@ -1818,7 +1883,8 @@ ws://host:3000?token=...    ─────────────────�
 | `get_room_info` | — | Запросить инфо о текущей комнате |
 | `place_bombs` | `bombs` (int[bombCount]) | Расставить бомбы (кол-во из request_bombs) |
 | `make_move` | `cell` (int 0..gridRows×gridCols-1) | Сделать ход |
-| `get_shop_items` | — | Список предметов магазина |
+| `get_shop_items` | `category` (опционально) | Список предметов магазина (фильтр по категории) |
+| `get_my_customization` | — | Текущая кастомизация игрока (для меню) |
 | `buy_item` | `itemId` | Купить предмет |
 | `equip_item` | `itemId` | Экипировать предмет |
 | `get_friends` | — | Список друзей |
@@ -1863,6 +1929,7 @@ ws://host:3000?token=...    ─────────────────�
 | `rematch_cancelled` | оставшемуся | оппонент вышел во время rematch countdown (с reason, newBalance) |
 | `left_room` | отправителю | вышел из комнаты (с newBalance) |
 | `shop_items` | отправителю | список предметов (8 типов: model, item_model, skin, effect, 4 анимации) |
+| `my_customization` | отправителю | текущая кастомизация (model_code, item_model_code, model_name, item_model_name и др.) |
 | `purchase_success` | отправителю | покупка успешна (с newBalance) |
 | `equip_success` | отправителю | экипировка успешна |
 | `friends_list` | отправителю | список друзей |
