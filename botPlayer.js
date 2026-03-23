@@ -8,8 +8,8 @@ const BOT_NAMES = [
 ];
 
 const DEFAULT_SKINS = ["default_skin1", "default_skin2", "default_skin3"];
-const DEFAULT_MODELS = ["character_default"];
-const DEFAULT_ITEM_MODELS = ["default_chip"];
+const DEFAULT_MODELS = ["model_default_1", "model_default_2"];
+const DEFAULT_ITEM_MODELS = ["item_default_chip"];
 
 function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];

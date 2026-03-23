@@ -102,21 +102,35 @@ app.post("/firebase-login", async (req, res) => {
 
         const randomSkinId = randomSkinResult.rows[0].id;
 
+        // Random default model from two free ones
+        const randomModelResult = await client.query(`
+          SELECT id FROM shop_items
+          WHERE code IN ('model_default_1','model_default_2')
+          ORDER BY RANDOM()
+          LIMIT 1
+        `);
+
+        if (randomModelResult.rows.length === 0) {
+          throw new Error("No default models found");
+        }
+
+        const randomModelId = randomModelResult.rows[0].id;
+
         await client.query(`
           INSERT INTO user_customization
           (user_id, model_id, item_model_id, skin_id, effect_id, animation_hit_id, animation_miss_id, animation_win_id, animation_lose_id)
           VALUES (
             $1,
-            (SELECT id FROM shop_items WHERE code = 'character_default' LIMIT 1),
-            (SELECT id FROM shop_items WHERE code = 'default_chip' LIMIT 1),
             $2,
+            (SELECT id FROM shop_items WHERE code = 'item_default_chip' LIMIT 1),
+            $3,
             (SELECT id FROM shop_items WHERE code = 'default_effect'),
             (SELECT id FROM shop_items WHERE code = 'default_anim' LIMIT 1),
             (SELECT id FROM shop_items WHERE code = 'default_anim_miss' LIMIT 1),
             (SELECT id FROM shop_items WHERE code = 'default_anim_win' LIMIT 1),
             (SELECT id FROM shop_items WHERE code = 'default_anim_lose' LIMIT 1)
           )
-        `, [user.id, randomSkinId]);
+        `, [user.id, randomModelId, randomSkinId]);
 
         await client.query("COMMIT");
       } catch (err) {
@@ -201,21 +215,31 @@ app.post("/register", async (req, res) => {
 
     const skinId = skinResult.rows[0].id;
 
+    // Random default model from two free ones
+    const modelResult = await client.query(`
+      SELECT id FROM shop_items
+      WHERE code IN ('model_default_1','model_default_2')
+      ORDER BY RANDOM()
+      LIMIT 1
+    `);
+
+    const modelId = modelResult.rows[0].id;
+
     await client.query(`
       INSERT INTO user_customization
       (user_id, model_id, item_model_id, skin_id, effect_id, animation_hit_id, animation_miss_id, animation_win_id, animation_lose_id)
       VALUES (
         $1,
-        (SELECT id FROM shop_items WHERE code = 'character_default' LIMIT 1),
-        (SELECT id FROM shop_items WHERE code = 'default_chip' LIMIT 1),
         $2,
+        (SELECT id FROM shop_items WHERE code = 'item_default_chip' LIMIT 1),
+        $3,
         (SELECT id FROM shop_items WHERE code = 'default_effect'),
         (SELECT id FROM shop_items WHERE code = 'default_anim' LIMIT 1),
         (SELECT id FROM shop_items WHERE code = 'default_anim_miss' LIMIT 1),
         (SELECT id FROM shop_items WHERE code = 'default_anim_win' LIMIT 1),
         (SELECT id FROM shop_items WHERE code = 'default_anim_lose' LIMIT 1)
       )
-    `, [user.id, skinId]);
+    `, [user.id, modelId, skinId]);
 
     await client.query("COMMIT");
 
@@ -815,8 +839,8 @@ async function loadPlayerCustomization(playerId) {
   `, [playerId]);
 
   return result.rows[0] || {
-    model_code: "character_default",
-    item_model_code: "default_chip",
+    model_code: "model_default_1",
+    item_model_code: "item_default_chip",
     skin_code: "default_skin1",
     effect_code: "default_effect",
     animation_hit_code: "default_anim",
@@ -1081,8 +1105,8 @@ async function matchPlayers(roomId, state, opponentWs, opponentId) {
         opponent: {
           id: opponentId,
           nickname: opponentNickname,
-          model_code: custom2.model_code || "character_default",
-          item_model_code: custom2.item_model_code || "default_chip",
+          model_code: custom2.model_code || "model_default_1",
+          item_model_code: custom2.item_model_code || "item_default_chip",
           skin_code: custom2.skin_code,
           effect_code: custom2.effect_code
         },
@@ -1104,8 +1128,8 @@ async function matchPlayers(roomId, state, opponentWs, opponentId) {
         opponent: {
           id: hostId,
           nickname: hostNickname,
-          model_code: custom1.model_code || "character_default",
-          item_model_code: custom1.item_model_code || "default_chip",
+          model_code: custom1.model_code || "model_default_1",
+          item_model_code: custom1.item_model_code || "item_default_chip",
           skin_code: custom1.skin_code,
           effect_code: custom1.effect_code
         },
@@ -1361,8 +1385,8 @@ async function broadcastRoomInfo(roomId) {
       player1: room.player1_id ? {
         id: room.player1_id,
         nickname: room.player1_nickname,
-        model_code: p1Custom?.model_code || "character_default",
-        item_model_code: p1Custom?.item_model_code || "default_chip"
+        model_code: p1Custom?.model_code || "model_default_1",
+        item_model_code: p1Custom?.item_model_code || "item_default_chip"
       } : null,
       player2: bot ? {
         id: bot.id,
@@ -1373,8 +1397,8 @@ async function broadcastRoomInfo(roomId) {
       } : (room.player2_id ? {
         id: room.player2_id,
         nickname: room.player2_nickname,
-        model_code: p2Custom?.model_code || "character_default",
-        item_model_code: p2Custom?.item_model_code || "default_chip"
+        model_code: p2Custom?.model_code || "model_default_1",
+        item_model_code: p2Custom?.item_model_code || "item_default_chip"
       } : null)
     }
   };
@@ -2295,8 +2319,8 @@ wss.on("connection", async (ws, req) => {
             opponentData = {
               id: opponentId,
               nickname: oppResult.rows[0]?.nickname || "Player",
-              model_code: oppCustom.model_code || "character_default",
-              item_model_code: oppCustom.item_model_code || "default_chip",
+              model_code: oppCustom.model_code || "model_default_1",
+              item_model_code: oppCustom.item_model_code || "item_default_chip",
               skin_code: oppCustom.skin_code,
               effect_code: oppCustom.effect_code
             };
@@ -2437,13 +2461,56 @@ wss.on("connection", async (ws, req) => {
         }
       }
 
+      // ===== SHOP: get_my_customization =====
+      if (data.type === "get_my_customization") {
+        const custResult = await pool.query(`
+          SELECT
+            uc.model_id, s_model.code as model_code, s_model.name as model_name,
+            uc.item_model_id, s_item_model.code as item_model_code, s_item_model.name as item_model_name,
+            uc.skin_id, s_skin.code as skin_code,
+            uc.effect_id, s_effect.code as effect_code,
+            s_hit.code as animation_hit_code,
+            s_miss.code as animation_miss_code,
+            s_win.code as animation_win_code,
+            s_lose.code as animation_lose_code
+          FROM user_customization uc
+          LEFT JOIN shop_items s_model ON uc.model_id = s_model.id
+          LEFT JOIN shop_items s_item_model ON uc.item_model_id = s_item_model.id
+          LEFT JOIN shop_items s_skin ON uc.skin_id = s_skin.id
+          LEFT JOIN shop_items s_effect ON uc.effect_id = s_effect.id
+          LEFT JOIN shop_items s_hit ON uc.animation_hit_id = s_hit.id
+          LEFT JOIN shop_items s_miss ON uc.animation_miss_id = s_miss.id
+          LEFT JOIN shop_items s_win ON uc.animation_win_id = s_win.id
+          LEFT JOIN shop_items s_lose ON uc.animation_lose_id = s_lose.id
+          WHERE uc.user_id = $1
+        `, [ws.user.id]);
+
+        ws.send(JSON.stringify({
+          type: "my_customization",
+          payload: custResult.rows[0] || null
+        }));
+      }
+
       // ===== SHOP: get_shop_items =====
       if (data.type === "get_shop_items") {
-        const itemsResult = await pool.query(`
-          SELECT id, code, name, type, price, currency
-          FROM shop_items
-          ORDER BY type, price
-        `);
+        const category = data.category || data.payload?.category || null;
+        const allowedCategories = ["model", "item_model", "skin", "effect", "animation_hit", "animation_miss", "animation_win", "animation_lose"];
+
+        let itemsResult;
+        if (category && allowedCategories.includes(category)) {
+          itemsResult = await pool.query(`
+            SELECT id, code, name, type, price, currency
+            FROM shop_items
+            WHERE type = $1
+            ORDER BY price
+          `, [category]);
+        } else {
+          itemsResult = await pool.query(`
+            SELECT id, code, name, type, price, currency
+            FROM shop_items
+            ORDER BY type, price
+          `);
+        }
 
         const ownedResult = await pool.query(
           "SELECT item_id FROM user_items WHERE user_id = $1",
