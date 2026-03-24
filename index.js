@@ -54,6 +54,46 @@ app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
+// ===== Ensure user_customization row exists =====
+async function ensureUserCustomization(userId) {
+  const existing = await pool.query(
+    "SELECT user_id FROM user_customization WHERE user_id = $1",
+    [userId]
+  );
+  if (existing.rows.length > 0) return;
+
+  const skinResult = await pool.query(`
+    SELECT id FROM shop_items
+    WHERE code IN ('default_skin1','default_skin2','default_skin3')
+    ORDER BY RANDOM() LIMIT 1
+  `);
+  const modelResult = await pool.query(`
+    SELECT id FROM shop_items
+    WHERE code IN ('model_default_1','model_default_2')
+    ORDER BY RANDOM() LIMIT 1
+  `);
+
+  const skinId = skinResult.rows[0]?.id;
+  const modelId = modelResult.rows[0]?.id;
+  if (!skinId || !modelId) return;
+
+  await pool.query(`
+    INSERT INTO user_customization
+    (user_id, model_id, item_model_id, skin_id, effect_id, animation_hit_id, animation_miss_id, animation_win_id, animation_lose_id)
+    VALUES (
+      $1, $2,
+      (SELECT id FROM shop_items WHERE code = 'item_default_chip' LIMIT 1),
+      $3,
+      (SELECT id FROM shop_items WHERE code = 'default_effect' LIMIT 1),
+      (SELECT id FROM shop_items WHERE code = 'default_anim' LIMIT 1),
+      (SELECT id FROM shop_items WHERE code = 'default_anim_miss' LIMIT 1),
+      (SELECT id FROM shop_items WHERE code = 'default_anim_win' LIMIT 1),
+      (SELECT id FROM shop_items WHERE code = 'default_anim_lose' LIMIT 1)
+    )
+    ON CONFLICT (user_id) DO NOTHING
+  `, [userId, modelId, skinId]);
+}
+
 // ===== HTTP: Firebase Login =====
 app.post("/firebase-login", async (req, res) => {
   const { idToken } = req.body;
@@ -2463,6 +2503,7 @@ wss.on("connection", async (ws, req) => {
 
       // ===== SHOP: get_my_customization =====
       if (data.type === "get_my_customization") {
+        await ensureUserCustomization(ws.user.id);
         const custResult = await pool.query(`
           SELECT
             uc.model_id, s_model.code as model_code, s_model.name as model_name,
@@ -2493,6 +2534,7 @@ wss.on("connection", async (ws, req) => {
 
       // ===== SHOP: get_shop_items =====
       if (data.type === "get_shop_items") {
+        await ensureUserCustomization(ws.user.id);
         const category = data.category || data.payload?.category || null;
         const allowedCategories = ["model", "item_model", "skin", "effect", "animation_hit", "animation_miss", "animation_win", "animation_lose"];
 
