@@ -707,6 +707,22 @@ function finishBombsPhase(roomId) {
   });
 
   game.phase = "playing";
+
+  // Отправляем каждому игроку позиции бомб противника для отрисовки
+  const playerIds = Object.keys(game.players).map(Number);
+  wss.clients.forEach(client => {
+    if (client.roomId === roomId && client.readyState === 1 && client.user) {
+      const myId = Number(client.user.id);
+      const opponentId = playerIds.find(id => id !== myId);
+      if (opponentId !== undefined && game.players[opponentId]) {
+        client.send(JSON.stringify({
+          type: "opponent_bombs",
+          payload: { bombs: game.players[opponentId].bombs }
+        }));
+      }
+    }
+  });
+
   broadcast(roomId, { type: "bombs_phase_finished" });
   startMoveTimer(roomId);
 }
